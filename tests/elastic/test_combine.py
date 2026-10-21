@@ -3,6 +3,10 @@
 """Installed-wheel Combine precision test; payload Dispatch is explicitly opt-in.
 
 NPU: python tests/elastic/test_combine.py --ep-size 2 --nproc-per-node 2 --output /tmp/combine-check
+
+The default --precision double-golden compares against CPU FP32 and ordered
+Torch NPU FP32/BF16 references. --precision exact retains the integer byte test.
+Reference generation is outside profiling and does not simulate communication.
 """
 
 import copy
@@ -251,6 +255,379 @@ def expected_output(routes, experts, rank, generation, hidden=7168):
     # Bounded integer fixtures make this factored sum exact in FP32/BF16.
     out = base * count + bias
     return out.to(torch.bfloat16)
+
+
+def floating_expert_rows(entries, generation, hidden, seed):
+    """Reproducible BF16 expert inputs, keyed by original (source, token, slot).
+
+    Generate on CPU for both the actual input and the references. Integer mixing
+    avoids CPU/NPU RNG differences; signed fractional values span nine exponents.
+    Duplicate expert slots deliberately have distinct contributions.
+    """
+    import torch
+
+    ids = torch.tensor(entries, dtype=torch.int64).reshape(-1, 3)
+    row = ids[:, 0] * 1000003 + ids[:, 1] * 9176 + ids[:, 2] * 6361
+    row = (row + (seed & 0x7FFFFFFF) + (generation & 0x7FFFFFFF) * 104729) & 0x7FFFFFFF
+    bits = (row[:, None] + torch.arange(hidden, dtype=torch.int64)[None, :] * 48271) & 0x7FFFFFFF
+    bits = ((bits ^ (bits >> 16)) * 1103515245 + 12345) & 0x7FFFFFFF
+    bits = bits ^ (bits >> 13)
+    mantissa = (bits % 65521).float() / 32768.0 - 1.0
+    scale = torch.pow(2.0, ((bits >> 20) % 9).float() - 4.0)
+    return (mantissa * scale).to(torch.bfloat16)
+
+
+def floating_expert_input(entries, generation, device, hidden, seed):
+    """Bound host temporaries even when many expert rows land on one rank."""
+    import torch
+
+    output = torch.empty((len(entries), hidden), dtype=torch.bfloat16, device=device)
+    for begin in range(0, len(entries), 256):
+        output[begin : begin + 256].copy_(floating_expert_rows(entries[begin : begin + 256], generation, hidden, seed))
+    return output
+
+
+def server_contribution_order(route, experts, world):
+    """Independent route oracle for this revision's server-deduplicated kernel.
+
+    Notify chooses the first valid top-k slot in each server as primary. Gateway
+    reduction visits the remaining slots in top-k order; final reduction visits
+    server IDs in ascending order. This also applies to EP2/4/8/16 in this tree.
+    No forward/backward list or output of the tested operator is consulted.
+    """
+    groups = {}
+    local_experts = experts // world
+    for slot, expert in enumerate(route):
+        if 0 <= expert < experts:
+            groups.setdefault(expert // local_experts // 8, []).append(slot)
+    return [groups[server] for server in sorted(groups)]
+
+
+def ordered_server_sum(contributions, orders):
+    """Torch operations on the input device; no parallel sum/scatter reduction.
+
+    The CPU device is only for unit tests. Production golden calls this on NPU.
+    Each group's FP32 sum is rounded to BF16, then accumulated in FP32 in server
+    order and rounded once more. Single-contributor groups preserve their input.
+    """
+    import torch
+
+    batch, _, hidden = contributions.shape
+    result = torch.zeros((batch, hidden), dtype=torch.float32, device=contributions.device)
+    rows = torch.arange(batch, device=contributions.device)
+    for group in range(max(map(len, orders), default=0)):
+        members = [order[group] if group < len(order) else [] for order in orders]
+        partial = torch.zeros_like(result)
+        for position in range(max(map(len, members))):
+            slots = torch.tensor(
+                [order[position] if position < len(order) else -1 for order in members],
+                dtype=torch.int64,
+                device=contributions.device,
+            )
+            value = contributions[rows, slots.clamp_min(0)].float()
+            candidate = value if position == 0 else torch.add(partial, value)
+            partial = torch.where((slots >= 0)[:, None], candidate, partial)
+        rounded = partial.to(torch.bfloat16).float()
+        result = rounded if group == 0 else torch.add(result, rounded)
+    return result.to(torch.bfloat16)
+
+
+def double_golden_outputs(routes, experts, rank, generation, hidden, seed, device="npu", batch_tokens=32):
+    """CPU FP32 high golden and Torch NPU same-precision golden, both on CPU.
+
+    Regenerate the exact BF16 expert inputs from route IDs, without transferring
+    payloads between ranks. CPU sums valid top-k contributions directly, with no
+    intermediate BF16 rounding. Only the NPU reference follows kernel grouping.
+    """
+    import torch
+
+    token_routes = routes[rank]
+    tokens, topk = len(token_routes), len(token_routes[0])
+    high = torch.empty((tokens, hidden), dtype=torch.float32)
+    low = torch.empty((tokens, hidden), dtype=torch.bfloat16)
+    if batch_tokens < 1:
+        raise ValueError("batch_tokens must be positive")
+    for begin in range(0, tokens, batch_tokens):
+        block = token_routes[begin : begin + batch_tokens]
+        entries = [(rank, token, slot) for token in range(begin, begin + len(block)) for slot in range(topk)]
+        values = floating_expert_rows(entries, generation, hidden, seed).reshape(len(block), topk, hidden)
+        valid = torch.tensor([[0 <= expert < experts for expert in row] for row in block])
+        cpu_sum = torch.zeros((len(block), hidden), dtype=torch.float32)
+        for slot in range(topk):
+            cpu_sum = torch.where(valid[:, slot, None], cpu_sum + values[:, slot].float(), cpu_sum)
+        high[begin : begin + len(block)] = cpu_sum
+        orders = [server_contribution_order(row, experts, len(routes)) for row in block]
+        low[begin : begin + len(block)] = ordered_server_sum(values.to(device), orders).cpu()
+    return high, low
+
+
+def double_golden_metrics(actual, high, low, chunk_elements=1048576):
+    """CatCCOS BF16 double-golden formulas (verify_result.py, 5d7a7bec4654).
+
+    Max/mean relative error ratios <10/<2, RMSE ratio <2, bias <=2**-7;
+    all ratio denominators have floor 2**-8 and relative error uses epsilon 1e-7.
+    FP32 element errors are accumulated with FP64 statistics in bounded chunks.
+    Unlike the upstream script, reject non-finite data in ANY of the three paths.
+    """
+    import torch
+
+    if actual.shape != high.shape or low.shape != high.shape or not high.numel():
+        raise AssertionError("Double golden requires matching nonempty shapes")
+    if actual.dtype != torch.bfloat16 or low.dtype != torch.bfloat16 or high.dtype != torch.float32:
+        raise AssertionError("Double golden requires BF16 actual/low and FP32 high")
+    if chunk_elements < 1:
+        raise ValueError("chunk_elements must be positive")
+    tensors = [tensor.detach().cpu().contiguous().view(-1) for tensor in (actual, high, low)]
+    count = high.numel()
+    # [max relative, sum relative, sum squared absolute] for actual and baseline.
+    stats = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    bias_sum = 0.0
+    for begin in range(0, count, chunk_elements):
+        a, g, b = [tensor[begin : begin + chunk_elements].float() for tensor in tensors]
+        if not all(torch.isfinite(tensor).all().item() for tensor in (a, g, b)):
+            raise AssertionError("Double golden rejects NaN/Inf in actual, CPU golden or NPU golden")
+        for index, value in enumerate((a, b)):
+            diff = value - g
+            relative = diff.abs() / (g.abs() + 1e-7)
+            stats[index][0] = max(stats[index][0], relative.max().item())
+            stats[index][1] += relative.sum(dtype=torch.float64).item()
+            stats[index][2] += diff.double().square().sum().item()
+            if index == 0:
+                bias_sum += (diff / g.abs().clamp_min(1)).sum(dtype=torch.float64).item()
+    metrics = {}
+    for name, (maximum, relative_sum, squared_sum) in zip(("actual", "npu_baseline"), stats):
+        metrics[name] = dict(
+            max_relative=maximum, mean_relative=relative_sum / count, rmse=math.sqrt(squared_sum / count)
+        )
+    ratios = {name: metrics["actual"][name] / max(metrics["npu_baseline"][name], 2**-8) for name in metrics["actual"]}
+    bias = abs(bias_sum / count)
+    passed = ratios["max_relative"] < 10 and ratios["mean_relative"] < 2 and ratios["rmse"] < 2 and bias <= 2**-7
+    return dict(
+        **metrics,
+        ratios=ratios,
+        eb=bias,
+        passed=passed,
+        elements=count,
+        thresholds=dict(max_relative_ratio=10, mean_relative_ratio=2, rmse_ratio=2, error_floor=2**-8, eb=2**-7),
+    )
+
+
+@pytest.mark.parametrize("world", [2, 4, 8, 16, 32, 64, 128, 256, 512])
+@pytest.mark.parametrize("mode", ["random", "duplicates", "invalid", "empty", "local_experts"])
+def test_double_golden_server_order_matches_notify(world, mode):
+    # Cross-check the independent numerical schedule against the existing CPU
+    # Notify oracle, including EP8/16 (server return in this repository).
+    experts, tokens, topk = 1024, 3, 6
+    routes = _notify["make_routes"](world, tokens, topk, experts, 0, mode, seed=7)
+    plans = _notify["build_notify_golden"](routes, experts, 256)["plans"]
+    entries = [_notify["expert_rows"](routes, experts, peer) for peer in range(world)]
+    actual = {}
+    for gateway, plan in enumerate(plans):
+        for source, tasks in enumerate(plan["forward_list"]):
+            cursor = 0
+            while cursor < len(tasks):
+                end, token, primary, _, _, _ = tasks[cursor]
+                slots = [entries[gateway][primary][2]]
+                for _, _, _, peer, row, _ in tasks[cursor:end]:
+                    if peer >= 0:
+                        slots.append(entries[peer][row][2])
+                actual[source, token, gateway // 8] = slots
+                cursor = end
+    for source, rows in enumerate(routes):
+        for token, route in enumerate(rows):
+            expected = [
+                actual[source, token, server] for server in range((world + 7) // 8) if (source, token, server) in actual
+            ]
+            assert server_contribution_order(route, experts, world) == expected
+
+
+def test_double_golden_rounding_and_server_order():
+    torch = pytest.importorskip("torch")
+    values = torch.tensor([[[256.0], [1.0], [-256.0]], [[2**24], [-(2**24)], [1.0]]], dtype=torch.bfloat16)
+    # First row: BF16(256+1) + BF16(-256) = 0, while CPU FP32 = 1.
+    # Second row: server order changes FP32 associativity; do not sort by slot.
+    result = ordered_server_sum(values, [[[0, 1], [2]], [[0], [2], [1]]])
+    assert result.tolist() == [[0.0], [0.0]]
+    assert values.float().sum(dim=1).tolist() == [[1.0], [1.0]]
+    assert ordered_server_sum(values[:1], [[[0, 1, 2]]]).item() == 1
+    assert ordered_server_sum(values[:1], [[]]).item() == 0
+
+
+@pytest.mark.parametrize("world", [8, 16, 32, 256])
+def test_double_golden_inputs_and_references_are_partition_independent(world):
+    torch = pytest.importorskip("torch")
+    tokens, topk, experts, hidden, generation, seed = 5, 6, 1024, 16, 2, 13
+    routes = _notify["make_routes"](world, tokens, topk, experts, 0, "invalid", seed=seed)
+    source = world - 1
+    high, low = double_golden_outputs(routes, experts, source, generation, hidden, seed, "cpu", 2)
+    other = double_golden_outputs(routes, experts, source, generation, hidden, seed, "cpu", tokens)
+    assert all(torch.equal(a, b) for a, b in zip((high, low), other))
+    expected = torch.zeros_like(high)
+    inputs = {}
+    for peer in range(world):
+        entries = _notify["expert_rows"](routes, experts, peer)
+        selected = [entry for entry in entries if entry[0] == source]
+        if not selected:
+            continue
+        data = floating_expert_input(selected, generation, "cpu", hidden, seed)
+        for entry, row in zip(selected, data):
+            inputs[entry[1], entry[2]] = row
+    for token in range(tokens):
+        for slot in range(topk):
+            if (token, slot) in inputs:
+                expected[token] += inputs[token, slot].float()
+    assert torch.equal(expected, high)
+    assert high.dtype == torch.float32 and low.dtype == torch.bfloat16
+    assert (high != high.to(torch.bfloat16).float()).any()  # high golden must not be pre-rounded
+    original = floating_expert_rows([(source, 0, 0), (source, 0, 1)], generation, hidden, seed)
+    assert not torch.equal(original[0], original[1])
+    assert not torch.equal(
+        original, floating_expert_rows([(source, 0, 0), (source, 0, 1)], generation + 1, hidden, seed)
+    )
+
+
+def test_double_golden_metrics_match_formulas_and_reject_corruption():
+    torch = pytest.importorskip("torch")
+    high = torch.tensor([[0.0, 1.001, -2.007, 7.013]], dtype=torch.float32)
+    low = high.to(torch.bfloat16)
+    result = double_golden_metrics(low, high, low, chunk_elements=2)
+    assert result["passed"]
+    diff = low.float() - high
+    relative = diff.abs() / (high.abs() + 1e-7)
+    assert result["actual"]["max_relative"] == relative.max().item()
+    assert result["actual"]["mean_relative"] == relative.double().mean().item()
+    assert result["actual"]["rmse"] == pytest.approx(diff.double().square().mean().sqrt().item())
+    assert result["eb"] == abs((diff / high.abs().clamp_min(1)).double().mean().item())
+    for name, error in result["actual"].items():
+        assert result["ratios"][name] == error / max(error, 2**-8)
+    assert not double_golden_metrics((low.float() + 1024).bfloat16(), high, low)["passed"]
+    zeros = torch.zeros_like(high)
+    assert double_golden_metrics(zeros.bfloat16(), zeros, zeros.bfloat16())["passed"]
+    # Strict <2: 1/128 absolute error with a zero baseline gives RMSE ratio 2.
+    shifted = torch.full_like(low, 2**-7)
+    assert not double_golden_metrics(shifted, zeros, zeros.bfloat16())["passed"]
+
+
+@pytest.mark.parametrize("which", [0, 1, 2])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_double_golden_rejects_nonfinite_paths(which, value):
+    torch = pytest.importorskip("torch")
+    tensors = [torch.ones((2, 3), dtype=dtype) for dtype in (torch.bfloat16, torch.float32, torch.bfloat16)]
+    tensors[which][0, 0] = value
+    with pytest.raises(AssertionError, match="NaN/Inf"):
+        double_golden_metrics(*tensors)
+
+
+def test_double_golden_rejects_shape_and_dtype_mismatch():
+    torch = pytest.importorskip("torch")
+    high = torch.ones((2, 3), dtype=torch.float32)
+    low = high.bfloat16()
+    with pytest.raises(AssertionError, match="shapes"):
+        double_golden_metrics(low[:, :1], high, low)
+    with pytest.raises(AssertionError, match="BF16 actual"):
+        double_golden_metrics(high, high, low)
+
+
+@pytest.mark.parametrize("precision", ["double-golden", "exact"])
+def test_double_golden_cli_selection(monkeypatch, tmp_path, precision):
+    calls = []
+    args = ["combine", "--ep-size", "8", "--output", str(tmp_path)]
+    if precision == "exact":
+        args += ["--precision", "exact"]
+    monkeypatch.setattr(sys, "argv", args)
+    monkeypatch.setitem(_notify, "_launch", lambda args, worker: calls.append(args.precision))
+    main()
+    assert calls == [precision]
+
+
+@pytest.mark.parametrize("fault", [None, "output", "retained"])
+def test_double_golden_run_case_wiring(monkeypatch, tmp_path, fault):
+    """CPU orchestration test only: exercise reporting/repeat/lifetime gates."""
+    from contextlib import nullcontext
+
+    torch = pytest.importorskip("torch")
+    module = sys.modules[__name__]
+    args = SimpleNamespace(
+        output=tmp_path,
+        route="local_experts",
+        tokens=2,
+        topk=2,
+        experts=4,
+        hidden=16,
+        seed=11,
+        repeat=2,
+        precision="double-golden",
+        check_dispatch=False,
+        dispatch_dtype="bf16",
+        without_weights=True,
+        profile_op=None,
+        chunk_tokens=256,
+        bootstrap="default",
+        case_id=0,
+        dense_channels=False,
+    )
+    routes = [[[source * 2, source * 2 + 1] for _ in range(args.tokens)] for source in range(2)]
+    monkeypatch.setitem(_notify, "make_routes", lambda *a, **kw: routes)
+    entries = _notify["expert_rows"](routes, 4, 0)
+    event = SimpleNamespace(current_stream_wait=lambda: None)
+    handle = SimpleNamespace()
+    for name in ("tensor", "empty"):
+        original = getattr(torch, name)
+
+        def cpu_factory(*a, _original=original, **kw):
+            if kw.get("device") == "npu":
+                kw["device"] = "cpu"
+            return _original(*a, **kw)
+
+        monkeypatch.setattr(torch, name, cpu_factory)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(Stream=object, stream=lambda _: nullcontext(), synchronize=lambda: None),
+        raising=False,
+    )
+    original_golden = double_golden_outputs
+    monkeypatch.setattr(module, "double_golden_outputs", lambda *a: original_golden(*a, device="cpu"))
+    monkeypatch.setattr(module, "prepare_routing", lambda *a: (None, None, handle, event))
+    monkeypatch.setattr(module, "check_handle", lambda *a: None)
+    monkeypatch.setattr(module, "build_reference", lambda *a: {})
+
+    class Buffer:
+        _runtime = SimpleNamespace(capacity=1 << 20)
+
+        def __init__(self):
+            self.outputs = []
+
+        def capture(self):
+            return event
+
+        def combine(self, expert, handle, **kwargs):
+            result = torch.zeros((args.tokens, args.hidden), dtype=torch.float32)
+            for row, (source, token, slot) in zip(expert, entries):
+                if source == 0:
+                    result[token] += row.float()
+            result = result.bfloat16()
+            if fault == "output":
+                result += 1024
+            if fault == "retained" and self.outputs:
+                self.outputs[0].add_(8)
+            self.outputs.append(result)
+            return result, None, event
+
+    buffer = Buffer()
+    if fault:
+        with pytest.raises(AssertionError):
+            run_case(buffer, args, 0, 2, {"source_sha256": {}}, lambda _: None, {})
+        assert not (tmp_path / "rank-0.json").exists()
+        records = json.loads((tmp_path / "rank-0-precision.json").read_text())
+        if fault == "output":
+            assert records[-1]["passed"] is False
+    else:
+        retained, _ = run_case(buffer, args, 0, 2, {"source_sha256": {}}, lambda _: None, {})
+        report = json.loads((tmp_path / "rank-0.json").read_text())
+        assert report["precision"] == "double-golden" and report["checks"] == 2
+        assert len(report["precision_records"]) == 4 and all(r["passed"] for r in report["precision_records"])
+        _notify["assert_bytes"](*retained, "retained after run_case")
 
 
 def weight_payload(ids, generation):
@@ -521,6 +898,28 @@ def run_case(buffer, args, rank, world, info, log, references):
     modes = _ROUTES if args.route == "all" else (args.route,)
     checks, retained, retained_weights = 0, None, None
     diagnostics = []
+    precision = getattr(args, "precision", "exact")
+    precision_records = []
+
+    def check_output(actual, label):
+        if precision == "exact":
+            _notify["assert_bytes"](actual, golden, label, progress=log)
+            return
+        record = dict(label=label, route=mode, generation=generation, mode=precision)
+        try:
+            record.update(double_golden_metrics(actual, golden, npu_golden))
+        except AssertionError as exc:
+            record.update(passed=False, error=str(exc))
+        precision_records.append(record)
+        # Publish failures too, before the outer worker records its exception.
+        path = args.output / f"rank-{rank}-precision.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(precision_records, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        temporary.replace(path)
+        log(f"{label} double_golden={json.dumps(record, allow_nan=False)}")
+        if not record["passed"]:
+            raise AssertionError(f"{label}: double-golden precision failed; see {path}")
+
     for mode in modes:
         log(f"route={mode} routes_and_expert_rows.begin (CPU)")
         routes = _notify["make_routes"](world, args.tokens, args.topk, args.experts, 0, mode, seed=args.seed)
@@ -572,6 +971,8 @@ def run_case(buffer, args, rank, world, info, log, references):
             if generation == 0:
                 log(f"{context} notify_metadata.check.begin")
                 check_handle(handle, reference, rank)
+                if getattr(handle, "_rank_return_plan", False):
+                    raise AssertionError("This test revision requires server-deduplicated metadata")
                 log(f"{context} notify_metadata.check.passed")
             check_dispatch_inputs(
                 args.check_dispatch,
@@ -595,14 +996,19 @@ def run_case(buffer, args, rank, world, info, log, references):
             producer = torch.npu.Stream()
             with torch.npu.stream(producer):
                 event.current_stream_wait()
-                if args.check_dispatch:
-                    expert_input = recv[0].float() * recv[1].repeat_interleave(128, dim=1) if fp8 else recv.float()
+                if precision == "double-golden":
+                    # Dispatch (when requested) is byte-checked above. Combine
+                    # gets independent fractional expert outputs in its row order.
+                    expert = floating_expert_input(entries, generation, "npu", args.hidden, args.seed)
                 else:
-                    expert_input = direct_expert_input(entries, generation, "npu", args.hidden)
-                bias = torch.tensor(
-                    [routes[s][t][k] % 3 - 1 + k % 3 - 1 for s, t, k in entries], dtype=torch.float32, device="npu"
-                )[:, None]
-                expert = (expert_input + bias).to(torch.bfloat16)
+                    if args.check_dispatch:
+                        expert_input = recv[0].float() * recv[1].repeat_interleave(128, dim=1) if fp8 else recv.float()
+                    else:
+                        expert_input = direct_expert_input(entries, generation, "npu", args.hidden)
+                    bias = torch.tensor(
+                        [routes[s][t][k] % 3 - 1 + k % 3 - 1 for s, t, k in entries], dtype=torch.float32, device="npu"
+                    )[:, None]
+                    expert = (expert_input + bias).to(torch.bfloat16)
                 weights = None if args.without_weights else weight_payload(weight_ids, generation).npu()
                 before = buffer.capture()
             log(f"{context} expert_compute.enqueued; combine.enter")
@@ -617,10 +1023,16 @@ def run_case(buffer, args, rank, world, info, log, references):
             else:
                 weight_golden = expected_weights(routes, args.experts, rank, generation)
                 _notify["assert_bytes"](values, weight_golden, f"{context} weights", progress=log)
-            log(f"{context} combine_golden.begin (CPU)")
-            golden = expected_output(routes, args.experts, rank, generation, args.hidden)
+            log(f"{context} combine_golden.begin precision={precision}")
+            if precision == "double-golden":
+                golden, npu_golden = double_golden_outputs(
+                    routes, args.experts, rank, generation, args.hidden, args.seed
+                )
+            else:
+                golden = expected_output(routes, args.experts, rank, generation, args.hidden)
             log(f"{context} combine_golden.done")
-            _notify["assert_bytes"](output, golden, f"{context} combine", progress=log)
+            check_output(output, f"{context} combine")
+            current_retained = (output, output.detach().cpu().clone())
             if args.profile_op and generation == 0:
 
                 def invoke():
@@ -633,7 +1045,7 @@ def run_case(buffer, args, rank, world, info, log, references):
                         assert result[1] is None
                     else:
                         _notify["assert_bytes"](result[1], weight_golden, "profile combine weights")
-                    _notify["assert_bytes"](result[0], golden, "profile combine")
+                    check_output(result[0], "profile combine")
 
                 diagnostics.append(
                     profile_combine(
@@ -654,12 +1066,12 @@ def run_case(buffer, args, rank, world, info, log, references):
             log(f"{context} repeated_combine.return (device completion not yet confirmed)")
             completed.current_stream_wait()
             assert no_weights is None
-            _notify["assert_bytes"](again, golden, f"{context} repeated combine", progress=log)
+            check_output(again, f"{context} repeated combine")
             if weights is not None:
                 changed = weight_payload(weight_ids, generation + 1).npu()
                 again, changed_out, completed = buffer.combine(expert, handle, topk_weights=changed)
                 completed.current_stream_wait()
-                _notify["assert_bytes"](again, golden, f"{context} changed weights hidden")
+                check_output(again, f"{context} changed weights hidden")
                 _notify["assert_bytes"](
                     changed_out,
                     expected_weights(routes, args.experts, rank, generation + 1),
@@ -669,19 +1081,29 @@ def run_case(buffer, args, rank, world, info, log, references):
             log(f"{context} retained_output_and_negative_checks.begin")
             if retained is not None:
                 _notify["assert_bytes"](*retained, "retained output")
-            retained = (output, golden)
+            # Lifetime is still checked byte-for-byte against the validated
+            # actual output, not against a tolerant floating-point golden.
+            _notify["assert_bytes"](*current_retained, "output after consecutive combines")
+            retained = current_retained
             if retained_weights is not None:
                 _notify["assert_bytes"](*retained_weights, "retained weights from previous iteration")
             if values is not None:
                 retained_weights = (values, weight_golden)
-            corrupt = golden.clone()
-            corrupt[0, 0] += 1
-            try:
-                _notify["assert_bytes"](output, corrupt, "negative control")
-            except AssertionError:
-                pass
+            if precision == "double-golden":
+                # All fixture contributions are bounded by 16; this shift
+                # decisively violates the metric even for a very large output.
+                corrupt = (output.detach().cpu().float() + 1024).to(torch.bfloat16)
+                if double_golden_metrics(corrupt, golden, npu_golden)["passed"]:
+                    raise AssertionError("Double-golden comparator accepted corrupted output")
             else:
-                raise AssertionError("Comparator accepted corrupted golden")
+                corrupt = golden.clone()
+                corrupt[0, 0] += 1
+                try:
+                    _notify["assert_bytes"](output, corrupt, "negative control")
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError("Comparator accepted corrupted golden")
             checks += 1
             log(f"{context} iteration.passed")
         print(f"[combine][rank={rank}] route={mode} precision passed", flush=True)
@@ -709,6 +1131,8 @@ def run_case(buffer, args, rank, world, info, log, references):
                 dispatch_checked=args.check_dispatch,
                 dispatch_executed=args.check_dispatch,
                 notify_checked=True,
+                precision=precision,
+                precision_records=precision_records,
                 combine_diagnostics=diagnostics,
                 test_files_sha256={
                     name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
@@ -1864,6 +2288,12 @@ def main():
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--experts", type=int, default=1024)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument(
+        "--precision",
+        choices=("double-golden", "exact"),
+        default="double-golden",
+        help="CPU FP32 / ordered Torch NPU double golden (default), or the original integer byte checks",
+    )
     parser.add_argument(
         "--dispatch-dtype",
         choices=("bf16", "fp8"),
