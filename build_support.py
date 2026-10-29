@@ -100,6 +100,7 @@ def source_fingerprint():
     ]
     for name in (
         "deep_ep",
+        "ascend_deepep",
         "csrc",
         "cmake",
         "scripts",
@@ -269,6 +270,15 @@ def build_configuration(environment=None):
     }
     result["source_version"] = (ROOT / "VERSION").read_text().strip()
     result["source_sha256"] = source_fingerprint()
+    import torch
+    import torch_npu
+
+    result["clos"] = {
+        "torch": torch.__version__,
+        "torch_npu": torch_npu.__version__,
+        "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+        "topk_idx_bits": 64,
+    }
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
     result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}

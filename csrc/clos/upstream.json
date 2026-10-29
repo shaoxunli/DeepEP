@@ -1,0 +1,53 @@
+{
+  "repository": "https://gitcode.com/lishaoxun/ascend_deepep",
+  "branch": "deepep",
+  "revision": "c09040328c853a011dfe37c74463c44723db4476",
+  "shmem_revision": "4dd80e2129da42bd773982c2bb3758af1ed0bba8",
+  "catlass_resource_headers": {
+    "revision": "48f7461afcff7c9282c6372c19d8768d9c6e0d9d",
+    "sha256": {
+      "catlass/arch/arch.hpp": "f9f730ef9dee785d90fb4a824421a3d514eb44d333abc7ec29efc44e40aa44a1",
+      "catlass/catlass.hpp": "6722651eac0dcdd20d802da02c2076ad02b052896a7fa4c0cc2f4b426afb3e92",
+      "catlass/detail/macros.hpp": "95cc548b250fd7de952e1cc2a557340d1ee62481b9906ceaef2f9ebfb2cf3e33",
+      "catlass/detail/dependent_false.hpp": "2678c7f4c1b4785bd275e45ac08f089aea153cd20ca94e9175dd455e77b20bb9",
+      "catlass/detail/alignment.hpp": "93d763a5a933d238587a2e97110b3ca1111c2106c235b1d1915b33a9b8abf5c7",
+      "catlass/arch/resource.hpp": "e7d2962ed6e8b04f90473cae103c1b061586b45993e00785b72842e2254f06d0",
+      "catlass/arch/local_tensor_buffer.hpp": "94bbbd9ace9e2427eea2097ef1c6f9f1ff4e419d866f76380cb7a3569c58e4a6",
+      "tla/numeric/integral_constant.hpp": "3395c6b668811639c4839c644f8b5f6d61374a3c9c8ae35b306c955fecd608d3",
+      "tla/numeric/math.hpp": "32deb37000c9a349ee5b9001360869947b5223bfa769635e13eedab5f93a59f1",
+      "tla/type_traits.hpp": "714913600b3bd37a208519dc539b0ef2bc72476b178bf400d67c40eeecf2da1a"
+    }
+  },
+  "kernel_sha256": {
+    "kernels/aggregate.cpp": "1b7277adc03e5604d0aec93971936d584dc04a0540d7b5a59c8a7a7b3394258e",
+    "kernels/combine.cpp": "9447d35a57944d76a694551f3a211892454ae3ac14407e13854d23b34c0330a8",
+    "kernels/combine_udma.cpp": "d14aaccf55454b5bd1e5321d796f931f9c77af17324e3cf016098696c55fb227",
+    "kernels/dispatch.cpp": "2c8398f5e9814ccf421e47ddf75237211efa2397fa343bac428f53b021a5d0a5",
+    "kernels/dispatch_layout.cpp": "dd0d1b8e458b57fab71de5ec0a5984a555c8b8f61028be234e7381d99b8b1036",
+    "kernels/dispatch_udma.cpp": "da11919574fab36dd6aa0286ba3493c71c6057b439f5236f93267a01cdab97cb",
+    "kernels/dup_server_dispatch.cpp": "0c19ccc0930ef9b2705f0535b2cd18a28d887418789936c9569108a1c606ba2d",
+    "kernels/dup_server_notify.cpp": "d92d8bc04937313e518f104c78a476832cfeb19109e0f18c4c5b423e737e6306",
+    "kernels/expand.cpp": "0003c714c775316c707fdbe96036875da1442360fa992da0311648575439f020",
+    "kernels/notify_combine.cpp": "c00dcb32236c7bbc4b0eaf4fdbcb23c740b39fcf92dfd173aed8561982e71f83",
+    "kernels/notify_dispatch.cpp": "107ecf9b83c4a0fea2a945e000d11ab5a441c3e7ce8541ae546b5578f4901965",
+    "include/ascend_deepep/platform.h": "705f3ea9e661d3537d7841ccae7f4a7fb7e911b967b5a3d46a4e76bca6c4a511",
+    "include/ascend_deepep/udma_schedule.h": "e0596ef5dd50362381182003581e091d9459deda8d48e164bd1019abb0782fb8",
+    "include/ascend_deepep/kernels/arch.h": "4bf9861d3a1f46e444f07f56e9c84076d737209b101488106272b44a28dd4c99",
+    "include/ascend_deepep/kernels/dispatch_recv_copy.h": "7d7c756b473a8fa760133fd4d774669714be340bdd54e641767189e3dd9c1807",
+    "include/ascend_deepep/kernels/dispatch_scale_pack.h": "c5ca2f356c8c674b4d23f3f17cf3cd60d52a44c86f3b7a1d61ea10aeae01dc8a",
+    "include/ascend_deepep/kernels/launch.h": "a9fc16b96ce95eb92448806f6d498860955e99c5ef9f888db0e64d9f994b002f",
+    "include/ascend_deepep/kernels/notify_dispatch_plan.h": "2cbf08b0dcc6f1a5b3db47f59853bf04d1fcd43c743c67ffc1fa4ff1bd98a2ca",
+    "include/ascend_deepep/kernels/notify_recv_prefix.h": "2a01d7a5ec534695a2875bcee6095b66bbd1ebdf665addefdd38ecf24b2756dc",
+    "include/ascend_deepep/kernels/types.h": "1eeae86a7aa331a0b3102ebc69395eba79d0e8c4ecdf291901a93d581853295f",
+    "include/ascend_deepep/kernels/udma_combine_schedule.h": "2c7e206111a81c93238bdaf1847a565b0f4e32d379a920a6081a1493ebe31ab3",
+    "include/ascend_deepep/kernels/udma_combine_sender.h": "a661b2fb95b4bb229db7d6b87d8eaf8ca47c0a53497f7d0c8e7fc5cfcedfdee2",
+    "include/ascend_deepep/kernels/udma_dispatch_metadata.h": "a0e43c64e176693b1dc09fdcd7d990ff0f5d46d3e14594788edb981d8b9f6f6e",
+    "include/ascend_deepep/kernels/udma_dispatch_schedule.h": "a2d1705f1a191882cd50ff2c759a09df2fb506f9170abd7a9aa792ecf580550d",
+    "include/ascend_deepep/kernels/udma_dispatch_sender.h": "fad61d62a5630388245ef04a3987624a023994842148a0690ab4de5ee57ed263",
+    "include/ascend_deepep/kernels/udma_shared_sender.h": "ea7f5155dcaa84039b26e2ffa75a5569e8d29f08b851b99cc485d18501bb16f7",
+    "include/ascend_deepep/kernels/udma_token_combine_schedule.h": "0e418a2eeee2b9eebef28c0290e62ef890b8f726ab6f58d0faf3b7d69ba089fd",
+    "include/ascend_deepep/kernels/udma_token_dispatch_schedule.h": "3f8e11dc88a1f644559931867f5dd764bca39c543e8cd6fce83b9872f3aa3bd3",
+    "include/ascend_deepep/kernels/v2_handle.h": "1316e191725a8fe85bab01b2f7ae6545d81b93fdee2be7aa2bc38be8085b7978"
+  },
+  "kernel_hash_format": "Exact upstream Git blob bytes (LF); no kernel algorithm changes."
+}

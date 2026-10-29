@@ -16,6 +16,15 @@ from deep_ep import _runtime
 from deep_ep.utils import event as events
 
 
+@pytest.fixture(autouse=True)
+def select_existing_pod_backend(monkeypatch):
+    # These are the original POD runtime fault-injection tests. Real selection
+    # and mixed-rank rejection are tested independently in test_machine_selection.
+    from deep_ep import _machine
+
+    monkeypatch.setattr(_machine, "select", lambda *a, **kw: {"machine_type": "pod", "source": "test"})
+
+
 class FakeEvent:
     def __init__(self, log):
         self.log = log

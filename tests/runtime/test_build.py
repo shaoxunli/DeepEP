@@ -28,6 +28,12 @@ def load(path):
 def build(monkeypatch):
     module = load(ROOT / "build_support.py")
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(__version__="build-test", _C=SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True))
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(__version__="build-test"))
     return module
 
 

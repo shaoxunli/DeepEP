@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 from .._native import _unavailable, require_native
 from .._runtime import Runtime, runtime_of, warn_unclosed
+from .._machine import MachineSelector
 
 if TYPE_CHECKING:
     import mpi4py.MPI
@@ -19,7 +20,7 @@ if TYPE_CHECKING:
     from ..utils.event import EventOverlap
 
 
-class Buffer:
+class Buffer(metaclass=MachineSelector):
     """Own a restricted native resource session; see docs/api.md."""
 
     def __init__(
@@ -34,6 +35,9 @@ class Buffer:
         explicitly_destroy: bool = False,
         enable_shrink: bool = False,
         comm: Optional["mpi4py.MPI.Comm"] = None,
+        *,
+        machine_type: str = "auto",
+        rootinfo_path: Optional[str] = None,
     ) -> None:
         """Create explicit-size MTE resources, not an EP algorithm backend.
 
@@ -67,8 +71,12 @@ class Buffer:
 
     @staticmethod
     def set_num_compute_units(new_num_compute_units: int) -> None:
-        """Declare Buffer.set_num_compute_units; execution is not implemented."""
-        _unavailable("Buffer.set_num_compute_units")
+        """Set the default AIV count for the Clos V1 implementation."""
+        from ascend_deepep.buffer import Buffer as ClosBuffer
+
+        ClosBuffer.set_num_sms(new_num_compute_units)
+
+    set_num_sms = set_num_compute_units
 
     @staticmethod
     def capture() -> EventOverlap:
@@ -97,13 +105,17 @@ class Buffer:
 
     @staticmethod
     def get_dispatch_config(num_ranks: int) -> Config:
-        """Declare Buffer.get_dispatch_config; execution is not implemented."""
-        _unavailable("Buffer.get_dispatch_config")
+        """Return the Clos V1 dispatch configuration."""
+        from ascend_deepep.buffer import Buffer as ClosBuffer
+        from .._config import Config
+
+        value = ClosBuffer.get_dispatch_config(num_ranks)
+        return Config(num_compute_units=value.num_aiv)
 
     @staticmethod
     def get_combine_config(num_ranks: int) -> Config:
-        """Declare Buffer.get_combine_config; execution is not implemented."""
-        _unavailable("Buffer.get_combine_config")
+        """Return the Clos V1 combine configuration."""
+        return Buffer.get_dispatch_config(num_ranks)
 
     def get_dispatch_layout(
         self,

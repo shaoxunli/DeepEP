@@ -310,3 +310,9 @@ We thank [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP) for the upstre
 ---
 
 Project material for which Lu Lu holds the relevant rights is licensed under the [BSD 2-Clause License](LICENSE). Other source material retains its own copyright notices and license texts.
+# Machine-specific backends
+
+This branch adds the Clos V1/V2 implementation alongside the existing POD backend,
+using the same pinned CANN SHMEM dependency and build workflow. Buffer constructors
+accept `machine_type="auto"`, `"pod"`, or `"clos_only"`; explicit selection is available
+when reliable rootinfo is absent. See [backend selection and compatibility](docs/machine_backends.md).

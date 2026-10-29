@@ -12,3 +12,12 @@ from .buffers import Buffer, ElasticBuffer, EPHandle
 from .utils import EventHandle, EventOverlap
 
 __all__ = ["Buffer", "ElasticBuffer", "EPHandle", "Config", "EventHandle", "EventOverlap"]
+
+
+def __getattr__(name):
+    # Keep package import metadata-only; Clos helpers load Torch on demand.
+    if name in {"topk_idx_t", "ExpandHandle", "Handle", "Slot", "SlotState"}:
+        import ascend_deepep
+
+        return getattr(ascend_deepep, name)
+    raise AttributeError(name)

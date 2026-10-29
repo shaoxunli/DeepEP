@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 from .._native import _unavailable, npu_api, require_native
 from .._runtime import Runtime, rank_and_world, runtime_of, warn_unclosed
+from .._machine import MachineSelector, HandleSelector
+from .._compat import keyword_aliases
 from ._elastic_layout import (
     combine_layout,
     dispatch_layout,
@@ -83,7 +85,7 @@ def _payload_empty(shape, *, dtype, device):
     return storage[:count].view(shape)
 
 
-class EPHandle:
+class EPHandle(metaclass=HandleSelector):
     """Routing metadata owner; metadata_only distinguishes notify from payload dispatch."""
 
     def __init__(
@@ -161,7 +163,7 @@ class EPHandle:
         self._dispatch_layout_cache = {}
 
 
-class ElasticBuffer:
+class ElasticBuffer(metaclass=MachineSelector):
     """Own a restricted native resource session; see docs/api.md."""
 
     def __init__(
@@ -189,6 +191,8 @@ class ElasticBuffer:
         combine_only: bool = False,
         use_1g_huge_pages: bool = True,
         debug_collectives: bool = False,
+        machine_type: str = "auto",
+        rootinfo_path: Optional[str] = None,
     ):
         """Initialize MTE+URMA using a group or explicit rank/world_size.
 
@@ -230,7 +234,13 @@ class ElasticBuffer:
             if not num_max_tokens_per_rank or not num_topk or not hidden:
                 raise NotImplementedError("Pass num_bytes or provide token/topk bounds and hidden")
             num_bytes = self.get_buffer_size_hint(
-                group, num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch, world_size=world_size
+                group,
+                num_max_tokens_per_rank,
+                hidden,
+                num_topk,
+                use_fp8_dispatch,
+                world_size=world_size,
+                machine_type="pod",
             )
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.hidden = hidden
@@ -268,6 +278,8 @@ class ElasticBuffer:
         allow_multiple_reduction: bool = True,
         *,
         world_size: Optional[int] = None,
+        machine_type: str = "auto",
+        rootinfo_path: Optional[str] = None,
     ) -> int:
         """Two SHMEM arenas sized for 1024 experts and four times average rows.
 
@@ -277,6 +289,22 @@ class ElasticBuffer:
         are included at every supported shape; actual allocation depends on the runtime.
         """
         require_native("ElasticBuffer.get_buffer_size_hint")
+        from .._machine import select
+
+        if select(machine_type, rootinfo_path=rootinfo_path)["machine_type"] == "clos_only":
+            from .._clos_adapter import ElasticBuffer as ClosElasticBuffer
+
+            if world_size is not None:
+                raise ValueError("Clos size hint requires its EP group, not an explicit world_size")
+            return ClosElasticBuffer.get_buffer_size_hint(
+                group,
+                num_max_tokens_per_rank,
+                hidden,
+                num_topk,
+                use_fp8_dispatch,
+                allow_hybrid_mode,
+                allow_multiple_reduction,
+            )
         validate_hidden(hidden, use_fp8_dispatch)
         if allow_hybrid_mode is not True or allow_multiple_reduction is not True:
             raise NotImplementedError("Dispatch sizing supports only default algorithm options")
@@ -683,7 +711,7 @@ class ElasticBuffer:
         native, npu = require_native("ElasticBuffer.dispatch"), npu_api()
         if getattr(runtime, "combine_only", False):
             raise ValueError("Dispatch requires combine_only=False when constructing ElasticBuffer")
-        if isinstance(handle, EPHandle) and handle.is_low_latency:
+        if issubclass(type(handle), EPHandle) and handle.is_low_latency:
             raise NotImplementedError("Cached dispatch is not supported for LL handles")
         if handle is None:
             hidden = x[0] if isinstance(x, tuple) and len(x) == 2 else x
@@ -792,7 +820,7 @@ class ElasticBuffer:
                     raise ValueError("Primary dispatch uses two QPs per peer; num_qps=0/2")
                 if handle is not None:
                     if (
-                        not isinstance(handle, EPHandle)
+                        not issubclass(type(handle), EPHandle)
                         or handle._buffer_token is not self._handle_token
                         or handle.metadata_only
                         or handle.metadata_version != 7
@@ -1009,7 +1037,7 @@ class ElasticBuffer:
         import torch
         from ..utils.event import EventHandle, EventOverlap
 
-        if isinstance(handle, EPHandle) and handle.is_low_latency:
+        if issubclass(type(handle), EPHandle) and handle.is_low_latency:
             return self._combine_low_latency(
                 x,
                 handle,
@@ -1045,7 +1073,7 @@ class ElasticBuffer:
                 ):
                     raise ValueError("previous_event must belong to the buffer NPU")
                 if (
-                    not isinstance(handle, EPHandle)
+                    not issubclass(type(handle), EPHandle)
                     or handle._buffer_token is not self._handle_token
                     or handle.metadata_only
                     or handle.metadata_version != 7
@@ -1507,3 +1535,21 @@ class ElasticBuffer:
                 runtime.notify_failed = True
                 # Keep all allocations until successful stream drain during destroy.
                 raise
+
+
+# Compatibility keywords translate to the original POD method without changing
+# its validation, scheduling, workspace, or completion behavior.
+ElasticBuffer.dispatch = keyword_aliases(ElasticBuffer.dispatch, {"num_sms": "num_compute_units"})
+ElasticBuffer.combine = keyword_aliases(ElasticBuffer.combine, {"num_sms": "num_compute_units"})
+ElasticBuffer.get_theoretical_num_qps = keyword_aliases(
+    ElasticBuffer.get_theoretical_num_qps, {"num_sms": "num_compute_units"}
+)
+ElasticBuffer.get_theoretical_num_sms = keyword_aliases(
+    ElasticBuffer.get_theoretical_num_compute_units,
+    {
+        "nvlink_gbs": "scaleup_gbs",
+        "rdma_gbs": "scaleout_gbs",
+        "sm_read_gbs": "compute_unit_read_gbs",
+        "sm_write_gbs": "compute_unit_write_gbs",
+    },
+)

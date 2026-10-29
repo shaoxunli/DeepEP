@@ -34,7 +34,18 @@ RUNTIME_METHODS = {
     "EPHandle.__init__",
 }
 BASELINE = json.loads(Path(__file__).with_name("api_contract.json").read_text(encoding="utf-8"))
-METHODS = [(name, method) for name, spec in BASELINE["objects"].items() for method in spec["methods"]]
+HOST_METHODS = {
+    "Buffer.set_num_compute_units",
+    "Buffer.set_num_sms",
+    "Buffer.get_dispatch_config",
+    "Buffer.get_combine_config",
+}
+METHODS = [
+    (name, method)
+    for name, spec in BASELINE["objects"].items()
+    for method in spec["methods"]
+    if name != "Config" and f"{name}.{method}" not in HOST_METHODS
+]
 
 
 class Uninspectable:
@@ -67,11 +78,12 @@ def test_every_declared_operation_fails_before_touching_inputs(name, method):
         for p in inspect.signature(operation).parameters.values()
         if p.default is inspect.Parameter.empty
     ]
-    with pytest.raises(NotImplementedError, match=rf"{name}\.{method} is not implemented"):
+    canonical = "get_theoretical_num_compute_units" if method == "get_theoretical_num_sms" else method
+    with pytest.raises(NotImplementedError, match=rf"{name}\.{canonical} is not implemented"):
         operation(*args)
 
 
-@pytest.mark.parametrize("name", BASELINE["exports"])
+@pytest.mark.parametrize("name", [name for name in BASELINE["exports"] if name != "Config"])
 def test_constructors_cannot_create_usable_objects(name):
     if INSTALLED_NATIVE and name in {
         "Buffer",

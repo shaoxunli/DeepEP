@@ -27,13 +27,13 @@ import torch, torch_npu
 assert not torch.npu.is_initialized(), 'Framework import already initialized an NPU'
 import deep_ep
 for construct in (lambda: deep_ep.Buffer.dispatch(None, None),
-                  lambda: deep_ep.ElasticBuffer.dispatch(None, None),
-                  deep_ep.Config):
+                  lambda: deep_ep.ElasticBuffer.dispatch(None, None)):
     try:
         construct()
     except NotImplementedError:
         continue
     raise AssertionError('Unimplemented communication/configuration unexpectedly succeeded')
+assert deep_ep.Config().num_compute_units == 20
 assert not torch.npu.is_initialized(), 'DeepEP declarations initialized an NPU'
 print(json.dumps({'torch': torch.__version__, 'torch_npu': torch_npu.__version__,
                   'npu_initialized': torch.npu.is_initialized(), 'deep_ep': deep_ep.__file__}))

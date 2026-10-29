@@ -7,6 +7,9 @@ Modified by Joyce_An 2026
 
 `deep_ep.ElasticBuffer` 提供 V2 dispatch/combine。高吞吐（HT）和低时延（LL）使用相同方法，输入、权重、布局及路径选择见 [Elastic 接口](elastic.md)。本页说明核心 `deep_ep` 的公共对象、初始化、资源生命周期和兼容范围。MegaMoE 的 `SymmBuffer/StoreGroup` 和 EpGmmFused 的 UDMA 域使用独立接口，分别见 [MegaMoE](../experiments/megamoe/README.md)与 [EpGmmFused](../experiments/ep_gmm_fused/README.md)。
 
+本页原有能力表与参数限制描述 POD 路径。新增 Clos V1/V2、自动选择和兼容别名见
+[机型后端说明](machine_backends.md)，不能把 POD 的限制套到 Clos 路径。
+
 ## 公共对象
 
 | 对象 | 导入路径 | 用途 |

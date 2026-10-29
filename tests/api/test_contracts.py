@@ -121,7 +121,10 @@ def test_transport_keyword_migration_has_no_implicit_alias(operation, old, new):
 )
 def test_transport_size_hint_migration_has_no_implicit_alias(cls, old, new):
     assert callable(getattr(cls, new))
-    assert not hasattr(cls, old)
+    if cls is deep_ep.Config:
+        assert getattr(cls, old) is getattr(cls, new)
+    else:
+        assert not hasattr(cls, old)
 
 
 @pytest.mark.parametrize("cached", [False, True])
