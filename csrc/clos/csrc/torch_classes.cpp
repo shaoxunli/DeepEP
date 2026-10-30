@@ -35,6 +35,8 @@ static auto buffer_runtime_registry =
         .def("is_initialized", &BufferRuntime::IsInitialized)
         .def("barrier", &BufferRuntime::Barrier)
         .def("destroy", &BufferRuntime::Destroy)
+        .def("abort_initialization", &BufferRuntime::AbortInitialization)
+        .def("mte_mapping_errors", &BufferRuntime::MteMappingErrors)
         .def("get_comm_meta_ptr", &BufferRuntime::CommMetaPtr)
         .def("get_workspace_ptr", &BufferRuntime::WorkspacePtr)
         .def("rank", &BufferRuntime::Rank)

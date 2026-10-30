@@ -20,7 +20,7 @@ else:
 
     LOCK = RLock()
 
-KINDS = ("auto", "pod", "clos_only")
+KINDS = ("auto", "pod", "clos_only", "card_4pmesh")
 
 
 def read_json(path):
@@ -40,15 +40,26 @@ def classify_root(root, topology, physical):
     levels = rank.get("level_list", [])
     if not levels or any(not level.get("rank_addr_list") for level in levels):
         raise ValueError("rootinfo has no usable endpoint records")
+    device_levels = []
     for level in levels:
         if level.get("net_type") not in ("MESH", "CLOS", "TOPO_FILE_DESC"):
             raise ValueError("unsupported rootinfo network type")
+        device_endpoints = []
         for endpoint in level["rank_addr_list"]:
+            # Card rootinfo can also describe a host NIC with an IP/d2h port.
+            # It is not evidence of an NPU Clos link or MTE reachability.
+            if endpoint.get("ports") == ["d2h"]:
+                continue
             addr = endpoint.get("addr", "")
             if endpoint.get("addr_type") != "EID" or len(addr) != 32 or len(bytes.fromhex(addr)) != 16:
                 raise ValueError("rootinfo endpoint must contain a 128-bit EID")
             if not endpoint.get("ports"):
                 raise ValueError("rootinfo endpoint has no ports")
+            device_endpoints.append(endpoint)
+        if device_endpoints:
+            device_levels.append(level)
+    if not device_levels:
+        raise ValueError("rootinfo has no usable NPU endpoint records")
     edges = topology.get("edge_list", [])
     relevant = [e for e in edges if local_id in (str(e.get("local_a")), str(e.get("local_b")))]
     # Exclude host PCIe declarations. They are not NPU-to-NPU Clos links.
@@ -57,9 +68,9 @@ def classify_root(root, topology, physical):
         raise ValueError("topology does not describe current device NPU ports")
     mesh = any("local_b" in e and e.get("topo_type") != "CLOS" for e in relevant)
     clos = any(e.get("topo_type") == "CLOS" or "local_b" not in e for e in relevant)
-    declared_mesh = any(level.get("net_type") == "MESH" for level in levels)
-    declared_clos = any(level.get("net_type") == "CLOS" for level in levels)
-    descriptor = any(level.get("net_type") == "TOPO_FILE_DESC" for level in levels)
+    declared_mesh = any(level.get("net_type") == "MESH" for level in device_levels)
+    declared_clos = any(level.get("net_type") == "CLOS" for level in device_levels)
+    descriptor = any(level.get("net_type") == "TOPO_FILE_DESC" for level in device_levels)
     if (
         (declared_mesh and not mesh)
         or (declared_clos and not clos)
@@ -71,6 +82,21 @@ def classify_root(root, topology, physical):
     # A mesh+Clos declaration alone is insufficient to identify a supported POD.
     if clos and mesh:
         return "mesh_and_clos"
+    if mesh:
+        # A four-card product must describe a complete four-vertex Mesh domain.
+        # Never infer the domain from physical_id // 4 or EP rank numbering.
+        neighbors = {}
+        for edge in edges:
+            if "local_b" not in edge or edge.get("topo_type") == "CLOS":
+                continue
+            if not any("/" in p for p in edge.get("local_a_ports", [])):
+                continue
+            a, b = str(edge["local_a"]), str(edge["local_b"])
+            neighbors.setdefault(a, set()).add(b)
+            neighbors.setdefault(b, set()).add(a)
+        domain = {local_id} | neighbors.get(local_id, set())
+        if len(domain) == 4 and all(neighbors.get(node) == domain - {node} for node in domain):
+            return "mesh4"
     raise ValueError("unsupported or incomplete NPU topology")
 
 
@@ -135,6 +161,10 @@ def detect(rootinfo_path=None):
             if board_id(physical) not in (3, 7):
                 raise ValueError("mesh+Clos product is not a validated POD; specify machine_type")
             kind = "pod"
+        elif kind == "mesh4":
+            if board_id(physical) != 0x6C:
+                raise ValueError("four-card Mesh requires CARD_4PMESH board 0x6c")
+            kind = "card_4pmesh"
         return {
             "machine_type": kind,
             "source": "rootinfo",
@@ -145,9 +175,28 @@ def detect(rootinfo_path=None):
     if rootinfo_path is not None:
         raise ValueError(f"explicit rootinfo is missing: {path}")
     board = board_id(physical)
-    if board not in (3, 7):
+    if board not in (3, 7, 0x6C):
         raise ValueError(f"no rootinfo and no validated rule for board 0x{board:02x}; specify machine_type")
-    return {"machine_type": "pod", "source": "dcmi_board_rule", "physical_device": physical, "board": board}
+    return {
+        "machine_type": "card_4pmesh" if board == 0x6C else "pod",
+        "source": "dcmi_board_rule",
+        "physical_device": physical,
+        "board": board,
+    }
+
+
+def gather_records(group, record):
+    """Object collective scoped to the supplied EP group, including MPI."""
+    import torch.distributed as dist
+
+    if isinstance(group, dist.ProcessGroup):
+        records = [None] * dist.get_world_size(group)
+        dist.all_gather_object(records, record, group=group)
+        return records
+    mpi = sys.modules.get("mpi4py.MPI")
+    if mpi is None or not isinstance(group, mpi.Comm):
+        raise TypeError("machine selection requires an EP ProcessGroup or MPI communicator")
+    return group.allgather(record)
 
 
 def select(machine_type="auto", group=None, rootinfo_path=None):
@@ -162,19 +211,7 @@ def select(machine_type="auto", group=None, rootinfo_path=None):
         error = f"{type(exc).__name__}: {exc}"
     record = {"selection": result, "error": error}
     if group is not None:
-        import torch.distributed as dist
-
-        # ProcessGroup.allgather accepts tensors, unlike MPI's object allgather.
-        if isinstance(group, dist.ProcessGroup):
-            records = [None] * dist.get_world_size(group)
-            dist.all_gather_object(records, record, group=group)
-        else:
-            # An existing MPI communicator already has its module loaded. Do not
-            # import/initialize optional MPI just to reject an unrelated object.
-            mpi = sys.modules.get("mpi4py.MPI")
-            if mpi is None or not isinstance(group, mpi.Comm):
-                raise TypeError("machine selection requires an EP ProcessGroup or MPI communicator")
-            records = group.allgather(record)
+        records = gather_records(group, record)
         failed = [(i, r["error"]) for i, r in enumerate(records) if r["error"]]
         if failed:
             raise RuntimeError(f"machine selection failed collectively: {failed}")
@@ -202,10 +239,16 @@ class MachineSelector(type):
         # SHMEM bootstrap remains responsible for its collective configuration.
         selection = select(machine_type, group, rootinfo)
         with LOCK:
-            if selection["machine_type"] == "clos_only":
+            if selection["machine_type"] in ("clos_only", "card_4pmesh"):
                 from ._clos_adapter import buffer_class
 
-                implementation = buffer_class(cls.__name__)
+                if selection["machine_type"] == "card_4pmesh":
+                    from ._card_adapter import buffer_class as card_class, prepare
+
+                    options = prepare(group, options)
+                    implementation = card_class(cls.__name__)
+                else:
+                    implementation = buffer_class(cls.__name__)
                 result = implementation(*args, **options)
             else:
                 aliases = (
@@ -230,9 +273,10 @@ class MachineSelector(type):
         return signature.replace(parameters=list(signature.parameters.values())[1:])
 
     def __instancecheck__(cls, instance):
-        module = sys.modules.get("deep_ep._clos_adapter")
-        if module is not None and type(instance) is module.buffer_class(cls.__name__):
-            return True
+        for name in ("deep_ep._clos_adapter", "deep_ep._card_adapter"):
+            module = sys.modules.get(name)
+            if module is not None and type(instance) is module.buffer_class(cls.__name__):
+                return True
         return super().__instancecheck__(instance)
 
 

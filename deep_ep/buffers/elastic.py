@@ -291,7 +291,7 @@ class ElasticBuffer(metaclass=MachineSelector):
         require_native("ElasticBuffer.get_buffer_size_hint")
         from .._machine import select
 
-        if select(machine_type, rootinfo_path=rootinfo_path)["machine_type"] == "clos_only":
+        if select(machine_type, rootinfo_path=rootinfo_path)["machine_type"] in ("clos_only", "card_4pmesh"):
             from .._clos_adapter import ElasticBuffer as ClosElasticBuffer
 
             if world_size is not None:

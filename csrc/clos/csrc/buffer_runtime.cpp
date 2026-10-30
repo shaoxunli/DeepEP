@@ -17,6 +17,7 @@
 #include <acl/acl.h>
 
 #include "csrc/common/check.h"
+#include "csrc/common/peer_mapping.h"
 #include "csrc/launcher.h"
 #include "csrc/ops/aggregate.h"
 #include "csrc/ops/combine.h"
@@ -162,6 +163,31 @@ void BufferRuntime::Barrier()
 void BufferRuntime::Destroy()
 {
     ReleaseResources(true);
+}
+
+void BufferRuntime::AbortInitialization()
+{
+    ReleaseResources(false);
+}
+
+std::vector<std::string> BufferRuntime::MteMappingErrors() const
+{
+    RequireShmem();
+    TORCH_CHECK(data_op_engine_type_ == ACLSHMEM_DATA_OP_MTE, "mapping preflight requires MTE-only transport");
+    std::vector<std::string> errors;
+    for (int peer = 0; peer < num_ranks_; ++peer) {
+        const auto check = [&](void* local, std::size_t bytes, const char* region) {
+            const auto error = MteMappingError(aclshmem_ptr(local, peer), bytes);
+            if (!error.empty()) {
+                errors.push_back("peer " + std::to_string(peer) + " " + region + ": " + error);
+            }
+        };
+        check(comm_meta_ptr_, kCommMetaBytes, "metadata");
+        if (num_bytes_ > 0) {
+            check(workspace_ptr_, static_cast<std::size_t>(num_bytes_), "workspace");
+        }
+    }
+    return errors;
 }
 
 void BufferRuntime::ReleaseResources(bool synchronize)

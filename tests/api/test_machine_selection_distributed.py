@@ -17,7 +17,7 @@ def _selection_worker(rank, store, result_dir):
     try:
         # A subgroup must be passed through, not silently replaced by WORLD.
         group = dist.new_group([0, 1], backend="gloo", timeout=timedelta(seconds=30))
-        for kind in ("pod", "clos_only"):
+        for kind in ("pod", "clos_only", "card_4pmesh"):
             assert _machine.select(kind, group)["machine_type"] == kind
             results.append(kind)
         _machine.detect = lambda _: {"machine_type": "clos_only", "source": "test"}
@@ -31,6 +31,26 @@ def _selection_worker(rank, store, result_dir):
         results.append("peer_error_rejected")
         assert _machine.select("pod", group)["machine_type"] == "pod"
         results.append("collective_order_preserved")
+        from deep_ep import _card_adapter
+        from types import SimpleNamespace
+
+        _card_adapter.host_identity = lambda: "same-host"
+        assert _card_adapter.prepare(group, {})["transport"] == "mte"
+        with pytest.raises(RuntimeError, match="preflight failed collectively"):
+            _card_adapter.prepare(group, {"transport": "udma" if rank == 0 else "mte"})
+        _card_adapter.host_identity = lambda: f"host-{rank}"
+        with pytest.raises(ValueError, match="same host"):
+            _card_adapter.prepare(group, {})
+        aborted = []
+        instance = _card_adapter._MappedMte()
+        instance._native = SimpleNamespace(
+            mte_mapping_errors=lambda: ["unmapped peer"] if rank == 0 else [],
+            abort_initialization=lambda: aborted.append(True),
+        )
+        with pytest.raises(RuntimeError, match="mapping check failed collectively"):
+            instance._validate_native_mappings(group)
+        assert aborted == [True] and instance._native is None
+        results.append("card_collective_guards")
         Path(result_dir, f"rank{rank}.json").write_text(json.dumps(results), encoding="utf-8")
         dist.destroy_process_group(group)
     finally:
@@ -67,10 +87,12 @@ def test_two_rank_gloo_selection(tmp_path):
         assert json.loads((tmp_path / f"rank{rank}.json").read_text()) == [
             "pod",
             "clos_only",
+            "card_4pmesh",
             "auto",
             "mixed_rejected",
             "peer_error_rejected",
             "collective_order_preserved",
+            "card_collective_guards",
         ]
 
 
@@ -79,5 +101,5 @@ def test_real_mpi_communicator_selection():
     mpi = pytest.importorskip("mpi4py.MPI")
     from deep_ep import _machine
 
-    for kind in ("pod", "clos_only"):
+    for kind in ("pod", "clos_only", "card_4pmesh"):
         assert _machine.select(kind, mpi.COMM_SELF)["machine_type"] == kind

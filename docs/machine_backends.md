@@ -1,4 +1,4 @@
-# POD 与全 Clos 后端
+# POD、全 Clos 与 PR 机型
 
 一个安装包包含两个独立实现，共用 `dependencies.lock.json` 固定的 CANN SHMEM
 `4dd80e2129da42bd773982c2bb3758af1ed0bba8`。POD 保留本仓已有的 HT、LL、
@@ -6,6 +6,7 @@
 `c09040328c853a011dfe37c74463c44723db4476`，包含 V1 Buffer、V2 ElasticBuffer、
 MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及原有资源接口。
 各实现继续使用自己的 kernel、工作区、QP 调度和 handle，功能范围不互相推导。
+PR（`CARD_4PMESH`，board `0x6c`）复用迁入实现的 MTE kernel，不另建一份 SHMEM。
 
 ## 构建
 
@@ -25,14 +26,16 @@ buffer = deep_ep.ElasticBuffer(
     hidden=6144,
     num_topk=8,
     explicitly_destroy=True,
-    machine_type="auto",  # auto / pod / clos_only
+    machine_type="auto",  # auto / pod / clos_only / card_4pmesh
 )
 print(buffer.machine_type, buffer.machine_selection)
 ```
 
 `auto` 读取当前物理 device 对应的 `/etc/hccl_rootinfo.json` 及其中引用的 topo 文件。
 `TOPO_FILE_DESC` 按 topo 边声明解释；有 Clos 且无 NPU Mesh 的设备选择 `clos_only`。
-Mesh+Clos 还需已核对的 POD board 规则（0x03/0x07）。缺省文件缺失时只回退到这些
+Mesh+Clos 还需已核对的 POD board 规则（0x03/0x07）。完整四卡 Mesh 域与 board `0x6c`
+共同选择 `card_4pmesh`；主机 NIC 的 `d2h` 声明不算 NPU Clos。
+缺省文件缺失时可回退到 POD 及 `0x6c` 的
 DCMI board 规则；DCMI 查询超时为 5 秒，不重试。未知 board、缺失端点、文件矛盾或
 不完整拓扑报错，要求显式指定，不能仅凭“16 卡”或某一 EID 位推断机型。
 `rootinfo_path="/path/to/rootinfo.json"` 可指定文件；显式文件错误不会悄悄回退。
@@ -62,6 +65,32 @@ buffer = deep_ep.Buffer(
 V2 的 `get_buffer_size_hint(..., machine_type=...)` 也须选择同一后端；容量查询是
 非 collective，不增加跨 rank 同步。直接让构造函数按 shape 计算可避免选错 hint。
 POD 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `shmem_ip_port` 方式。
+
+## PR：四卡 Mesh 与跨域 PCIe
+
+V1 Buffer 和 V2 ElasticBuffer 均支持 `machine_type="card_4pmesh"`。自动识别或显式
+指定后，省略 `transport`、`None` 和 `"auto"` 均固定使用 `"mte"`，不受 V2 的
+`ASCEND_DEEPEP_TRANSPORT` 默认值影响。显式 UDMA/RoCE/SDMA 和 UDMA token 调度会
+在初始化前集体报错；当前 PR 适配只支持同机 EP ProcessGroup/MPI communicator。
+
+```python
+buffer = deep_ep.ElasticBuffer(
+    group=ep_group,
+    num_max_tokens_per_rank=8192, hidden=6144, num_topk=8,
+    machine_type="card_4pmesh", explicitly_destroy=True,
+)
+assert buffer.transport == "mte"
+```
+
+初始化前比较组内 Linux boot ID；缺失或不同则拒绝，不用 hostname 或 rank 编号猜同机。
+SHMEM 初始化后、DeepEP 算子启动前，逐 peer 查询 metadata/workspace 的 Runtime 内存范围。
+地址仅非空不足以通过：映射必须覆盖整个区间，查询不支持、失败或范围不足均集体报错并
+释放本次 native 资源，不回退为盲读。失败路径不执行 DeepEP 的设备 barrier。
+这些检查只在构造阶段运行，fresh/cached 热路径、分核及通信同步不变。
+
+此变更需要按原构建流程重新编译安装 native 扩展；旧库缺少查询方法会拒绝初始化。
+映射存在不等于物理链路健康或已验证性能。PR 域内 EP4、跨域 EP8/EP16、多组 EP4 的
+NPU 精度与稳定性尚待实机验证；不能将 POD 环境结果视为 PR 验证通过。
 
 ## 参数与生命周期
 

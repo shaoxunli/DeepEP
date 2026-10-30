@@ -41,6 +41,8 @@ public:
     bool IsInitialized() const;
     void Barrier();
     void Destroy();
+    void AbortInitialization();
+    std::vector<std::string> MteMappingErrors() const;
     int64_t CommMetaPtr() const;
     int64_t WorkspacePtr() const;
     int64_t Rank() const;

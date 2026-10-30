@@ -254,6 +254,9 @@ class ElasticBuffer:
                 True,
                 udma_schedule == "token",
             )
+            mapping_check = getattr(self, "_validate_native_mappings", None)
+            if mapping_check is not None:
+                mapping_check(resolved_group)
         self.num_device_aiv = int(self._native.num_device_aiv())
         if self.num_device_aiv < 2:
             raise RuntimeError("V2 elastic communication requires at least 2 AIVs")

@@ -162,6 +162,9 @@ class Buffer:
                 True,  # V1 requests shared Jetty when the resolved transport is UDMA.
                 udma_schedule == "token",
             )
+            mapping_check = getattr(self, "_validate_native_mappings", None)
+            if mapping_check is not None:
+                mapping_check(comm if comm is not None else resolved_group)
         # Slot/generation tracks one future layout -> dispatch -> combine
         # session. The native runtime owns the symmetric workspace itself.
         self._slot = Slot(0, owner=self, native_resources=self._native)
