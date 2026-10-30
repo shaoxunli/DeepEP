@@ -162,15 +162,19 @@ def select(machine_type="auto", group=None, rootinfo_path=None):
         error = f"{type(exc).__name__}: {exc}"
     record = {"selection": result, "error": error}
     if group is not None:
-        if hasattr(group, "allgather"):
-            records = group.allgather(record)
-        else:
-            import torch.distributed as dist
+        import torch.distributed as dist
 
-            if not isinstance(group, dist.ProcessGroup):
-                raise TypeError("machine selection requires an EP ProcessGroup or MPI communicator")
+        # ProcessGroup.allgather accepts tensors, unlike MPI's object allgather.
+        if isinstance(group, dist.ProcessGroup):
             records = [None] * dist.get_world_size(group)
             dist.all_gather_object(records, record, group=group)
+        else:
+            # An existing MPI communicator already has its module loaded. Do not
+            # import/initialize optional MPI just to reject an unrelated object.
+            mpi = sys.modules.get("mpi4py.MPI")
+            if mpi is None or not isinstance(group, mpi.Comm):
+                raise TypeError("machine selection requires an EP ProcessGroup or MPI communicator")
+            records = group.allgather(record)
         failed = [(i, r["error"]) for i, r in enumerate(records) if r["error"]]
         if failed:
             raise RuntimeError(f"machine selection failed collectively: {failed}")

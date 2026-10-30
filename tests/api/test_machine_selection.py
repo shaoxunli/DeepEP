@@ -56,15 +56,47 @@ def test_override_needs_no_runtime_or_rootinfo(monkeypatch):
 
 
 def test_consensus_rejects_mixed_backends_and_local_errors(monkeypatch):
+    pytest.importorskip("torch.distributed")
+
     class Group:
         def allgather(self, record):
             return [record, {"selection": {"machine_type": "clos_only"}, "error": None}]
 
+    monkeypatch.setitem(sys.modules, "mpi4py.MPI", SimpleNamespace(Comm=Group))
     with pytest.raises(ValueError, match="different"):
         _machine.select("pod", Group())
     monkeypatch.setattr(_machine, "detect", lambda _: (_ for _ in ()).throw(ValueError("bad topology")))
     with pytest.raises(RuntimeError, match="collectively"):
         _machine.select("auto", Group())
+
+
+def test_torch_process_group_uses_object_collective(monkeypatch):
+    dist = pytest.importorskip("torch.distributed")
+    group = dist.ProcessGroup(0, 1)
+    assert hasattr(group, "allgather")  # The real type that exposed the MPI misclassification.
+    calls = []
+
+    def gather(output, record, *, group):
+        calls.append(group)
+        output[:] = [record]
+
+    monkeypatch.setattr(dist, "get_world_size", lambda actual: 1 if actual is group else pytest.fail("wrong group"))
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    assert _machine.select("clos_only", group)["machine_type"] == "clos_only"
+    assert calls == [group]
+
+
+def test_unrelated_allgather_object_is_rejected(monkeypatch):
+    pytest.importorskip("torch.distributed")
+    monkeypatch.delitem(sys.modules, "mpi4py.MPI", raising=False)
+
+    class NotACommunicator:
+        def allgather(self, record):
+            pytest.fail("must not call an unrelated allgather method")
+
+    with pytest.raises(TypeError, match="ProcessGroup or MPI"):
+        _machine.select("pod", NotACommunicator())
+    assert "mpi4py.MPI" not in sys.modules
 
 
 def test_driver_timeout_is_not_retried(monkeypatch):
