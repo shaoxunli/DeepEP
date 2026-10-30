@@ -139,7 +139,7 @@ def test_aliases_preserve_defaults_and_reject_conflicts():
 def test_backend_is_selected_once_and_constructor_defaults_are_preserved(monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "require_native", lambda _: None, raising=False)
     calls = []
-    monkeypatch.setattr(_machine, "select", lambda *args: calls.append(args) or {"machine_type": "pod"})
+    monkeypatch.setattr(_machine, "select", lambda *args, **kw: calls.append((args, kw)) or {"machine_type": "pod"})
 
     class ElasticBuffer(metaclass=_machine.MachineSelector):
         def __init__(self, group, num_device_timeout_secs=7):

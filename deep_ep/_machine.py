@@ -21,6 +21,9 @@ else:
     LOCK = RLock()
 
 KINDS = ("auto", "pod", "clos_only", "card_4pmesh")
+# Only the migrated implementation takes an engine argument internally. POD
+# retains its own initialization contract and mixed-engine configuration.
+_TRANSPORT_BY_MACHINE = {"clos_only": "udma", "card_4pmesh": "mte"}
 
 
 def read_json(path):
@@ -199,9 +202,11 @@ def gather_records(group, record):
     return group.allgather(record)
 
 
-def select(machine_type="auto", group=None, rootinfo_path=None):
+def select(machine_type="auto", group=None, rootinfo_path=None, *, transport_provided=False):
     error, result = None, None
     try:
+        if transport_provided:
+            raise TypeError("transport is selected by machine_type; remove the transport argument")
         if machine_type not in KINDS:
             raise ValueError(f"machine_type must be one of {KINDS}")
         result = (
@@ -237,7 +242,10 @@ class MachineSelector(type):
             group = options.get("comm")
         # The target's explicit-rank MPI path has no ProcessGroup. Native
         # SHMEM bootstrap remains responsible for its collective configuration.
-        selection = select(machine_type, group, rootinfo)
+        # Reject the removed public option in the same collective as topology
+        # selection, so a rank-local old argument cannot strand the other ranks
+        # inside SHMEM initialization. Even None/auto/matching values are errors.
+        selection = select(machine_type, group, rootinfo, transport_provided="transport" in options)
         with LOCK:
             if selection["machine_type"] in ("clos_only", "card_4pmesh"):
                 from ._clos_adapter import buffer_class
@@ -245,10 +253,12 @@ class MachineSelector(type):
                 if selection["machine_type"] == "card_4pmesh":
                     from ._card_adapter import buffer_class as card_class, prepare
 
-                    options = prepare(group, options)
+                    prepare(group, options)
                     implementation = card_class(cls.__name__)
                 else:
                     implementation = buffer_class(cls.__name__)
+                # Explicit internal values override legacy environment defaults.
+                options["transport"] = _TRANSPORT_BY_MACHINE[selection["machine_type"]]
                 result = implementation(*args, **options)
             else:
                 aliases = (

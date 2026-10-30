@@ -314,5 +314,9 @@ Project material for which Lu Lu holds the relevant rights is licensed under the
 
 This branch adds the Clos V1/V2 implementation alongside the existing POD backend,
 using the same pinned CANN SHMEM dependency and build workflow. Buffer constructors
-accept `machine_type="auto"`, `"pod"`, or `"clos_only"`; explicit selection is available
-when reliable rootinfo is absent. See [backend selection and compatibility](docs/machine_backends.md).
+accept `machine_type="auto"`, `"pod"`, `"clos_only"`, or `"card_4pmesh"`; explicit
+selection is available when reliable rootinfo is absent. The machine selects the
+communication engines: Clos uses MTE + UDMA, CARD_4PMESH uses MTE, and POD keeps its
+existing configuration. Public constructors do not accept `transport`; remove it
+from older calls. `ASCEND_DEEPEP_TRANSPORT` does not override this policy.
+See [backend selection and compatibility](docs/machine_backends.md).

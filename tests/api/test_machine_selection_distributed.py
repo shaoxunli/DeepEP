@@ -31,13 +31,27 @@ def _selection_worker(rank, store, result_dir):
         results.append("peer_error_rejected")
         assert _machine.select("pod", group)["machine_type"] == "pod"
         results.append("collective_order_preserved")
+        import deep_ep
+        from deep_ep.buffers import elastic, legacy
+
+        # An old argument on just one rank must stop both before any backend
+        # initializes. Matching/None values are removed arguments too.
+        elastic.require_native = legacy.require_native = lambda _: None
+        for api in (deep_ep.Buffer, deep_ep.ElasticBuffer):
+            for kind in ("auto", "pod", "clos_only", "card_4pmesh"):
+                for old_value in (None, "auto", "mte", "udma"):
+                    options = {"transport": old_value} if rank == 0 else {}
+                    with pytest.raises(RuntimeError, match="transport is selected by machine_type"):
+                        api(group, machine_type=kind, **options)
+        assert _machine.select("pod", group)["machine_type"] == "pod"
+        results.append("removed_transport_rejected_collectively")
         from deep_ep import _card_adapter
         from types import SimpleNamespace
 
         _card_adapter.host_identity = lambda: "same-host"
-        assert _card_adapter.prepare(group, {})["transport"] == "mte"
+        _card_adapter.prepare(group, {})
         with pytest.raises(RuntimeError, match="preflight failed collectively"):
-            _card_adapter.prepare(group, {"transport": "udma" if rank == 0 else "mte"})
+            _card_adapter.prepare(group, {"udma_schedule": "token" if rank == 0 else "peer"})
         _card_adapter.host_identity = lambda: f"host-{rank}"
         with pytest.raises(ValueError, match="same host"):
             _card_adapter.prepare(group, {})
@@ -92,6 +106,7 @@ def test_two_rank_gloo_selection(tmp_path):
             "mixed_rejected",
             "peer_error_rejected",
             "collective_order_preserved",
+            "removed_transport_rejected_collectively",
             "card_collective_guards",
         ]
 

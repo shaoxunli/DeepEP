@@ -21,9 +21,6 @@ def prepare(group, options):
         raise ValueError("card_4pmesh requires an EP ProcessGroup or MPI communicator")
     error, host = None, None
     try:
-        transport = options.get("transport")
-        if transport is not None and str(transport).strip().lower() not in ("auto", "mte"):
-            raise ValueError("card_4pmesh currently supports only transport='mte'")
         if options.get("udma_schedule", "peer") != "peer":
             raise ValueError("card_4pmesh does not support the UDMA token schedule")
         host = host_identity()
@@ -35,8 +32,6 @@ def prepare(group, options):
         raise RuntimeError(f"card_4pmesh preflight failed collectively: {errors}")
     if len({record["host"] for record in records}) != 1:
         raise ValueError("card_4pmesh MTE requires all EP ranks on the same host")
-    # Explicit policy also prevents the V2 environment default from selecting UDMA.
-    return {**options, "transport": "mte"}
 
 
 class _MappedMte:

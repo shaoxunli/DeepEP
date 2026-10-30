@@ -109,20 +109,15 @@ def test_host_identity_requires_valid_boot_id(monkeypatch, value):
             _card_adapter.host_identity()
 
 
-@pytest.mark.parametrize("transport", [None, "auto", "mte", "MTE"])
-def test_mte_default_and_override(card, transport, monkeypatch):
-    monkeypatch.setenv("ASCEND_DEEPEP_TRANSPORT", "udma")
-    options = {"transport": transport}
-    assert card.prepare(object(), options)["transport"] == "mte"
-    assert options["transport"] == transport
+def test_card_preflight_does_not_change_constructor_options(card):
+    options = {"udma_schedule": "peer", "num_bytes": 123456}
+    card.prepare(object(), options)
+    assert options == {"udma_schedule": "peer", "num_bytes": 123456}
 
 
-@pytest.mark.parametrize(
-    "options", [{"transport": "udma"}, {"transport": "sdma"}, {"transport": "roce"}, {"udma_schedule": "token"}]
-)
-def test_incompatible_transport_rejected_collectively(card, options):
+def test_incompatible_schedule_rejected_collectively(card):
     with pytest.raises(RuntimeError, match="preflight failed collectively"):
-        card.prepare(object(), options)
+        card.prepare(object(), {"udma_schedule": "token"})
 
 
 def test_card_requires_same_host_and_group(card, monkeypatch):
@@ -168,7 +163,7 @@ def test_public_card_construction_checks_before_device_barrier(kind, fault, card
         def num_device_aiv(self):
             return 64
 
-    monkeypatch.setattr(_machine, "select", lambda *args: {"machine_type": "card_4pmesh", "source": "test"})
+    monkeypatch.setattr(_machine, "select", lambda *args, **kw: {"machine_type": "card_4pmesh", "source": "test"})
     monkeypatch.setattr(legacy, "require_native", lambda _: None)
     monkeypatch.setattr(public_elastic, "require_native", lambda _: None)
     monkeypatch.setattr(source_v1, "_is_capturing", lambda: False)
