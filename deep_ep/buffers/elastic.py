@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 from .._native import _unavailable, npu_api, require_native
 from .._runtime import Runtime, rank_and_world, runtime_of, warn_unclosed
 from .._machine import MachineSelector, HandleSelector
-from .._compat import keyword_aliases
+from .._compat import public_keywords
 from ._elastic_layout import (
     combine_layout,
     dispatch_layout,
@@ -161,6 +161,15 @@ class EPHandle(metaclass=HandleSelector):
         self._gather_stride = None
         self._combine_layout_cache = None
         self._dispatch_layout_cache = {}
+
+    @property
+    def num_sms(self):
+        """The saved AIV count; the upstream name does not change its unit."""
+        return self.num_compute_units
+
+    @num_sms.setter
+    def num_sms(self, value):
+        self.num_compute_units = value
 
 
 class ElasticBuffer(metaclass=MachineSelector):
@@ -1539,17 +1548,24 @@ class ElasticBuffer(metaclass=MachineSelector):
 
 # Compatibility keywords translate to the original POD method without changing
 # its validation, scheduling, workspace, or completion behavior.
-ElasticBuffer.dispatch = keyword_aliases(ElasticBuffer.dispatch, {"num_sms": "num_compute_units"})
-ElasticBuffer.combine = keyword_aliases(ElasticBuffer.combine, {"num_sms": "num_compute_units"})
-ElasticBuffer.get_theoretical_num_qps = keyword_aliases(
+ElasticBuffer.__init__ = public_keywords(ElasticBuffer.__init__, {"num_gpu_timeout_secs": "num_device_timeout_secs"})
+EPHandle.__init__ = public_keywords(EPHandle.__init__, {"num_sms": "num_compute_units"})
+ElasticBuffer.dispatch = public_keywords(
+    ElasticBuffer.dispatch,
+    {"num_sms": "num_compute_units", "use_tma_aligned_col_major_sf": "use_aligned_col_major_sf"},
+)
+ElasticBuffer.combine = public_keywords(ElasticBuffer.combine, {"num_sms": "num_compute_units"})
+ElasticBuffer.get_theoretical_num_qps = public_keywords(
     ElasticBuffer.get_theoretical_num_qps, {"num_sms": "num_compute_units"}
 )
-ElasticBuffer.get_theoretical_num_sms = keyword_aliases(
+ElasticBuffer.get_theoretical_num_sms = public_keywords(
     ElasticBuffer.get_theoretical_num_compute_units,
     {
         "nvlink_gbs": "scaleup_gbs",
         "rdma_gbs": "scaleout_gbs",
-        "sm_read_gbs": "compute_unit_read_gbs",
-        "sm_write_gbs": "compute_unit_write_gbs",
+        "sm_read_gbs": "compute_read_gbs",
+        "sm_write_gbs": "compute_write_gbs",
     },
+    aliases={"compute_unit_read_gbs": "compute_read_gbs", "compute_unit_write_gbs": "compute_write_gbs"},
 )
+ElasticBuffer.get_theoretical_num_compute_units = ElasticBuffer.get_theoretical_num_sms

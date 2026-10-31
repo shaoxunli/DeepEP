@@ -36,14 +36,23 @@ def keyword_aliases(function, aliases):
     return call
 
 
-def platform_keywords(function, aliases):
-    """Publish Ascend names while still accepting the pinned backend keywords."""
-    call = keyword_aliases(function, aliases)
-    names = {old: new for new, old in aliases.items()}
+def public_keywords(function, names, *, aliases=None):
+    """Publish upstream names, accepting existing implementation names as aliases.
+
+    ``names`` maps public keywords to implementation keywords. Extra aliases
+    do not affect the published signature. Values and defaults are never scaled.
+    All reflection occurs once, when the wrapper is created.
+    """
     signature = inspect.signature(function)
+    mapping = {**(aliases or {}), **names}
+    for target in mapping.values():
+        if target not in signature.parameters:
+            raise ValueError(f"unknown implementation parameter: {target}")
+    call = keyword_aliases(function, mapping)
+    published = {old: new for new, old in names.items()}
     call.__signature__ = signature.replace(
         parameters=[
-            parameter.replace(name=names.get(parameter.name, parameter.name))
+            parameter.replace(name=published.get(parameter.name, parameter.name))
             for parameter in signature.parameters.values()
         ]
     )

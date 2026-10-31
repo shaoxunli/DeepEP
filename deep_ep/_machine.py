@@ -231,8 +231,6 @@ class MachineSelector(type):
     """Keep the existing POD class and methods; select Clos before construction."""
 
     def __call__(cls, *args, **kwargs):
-        from ._compat import translate
-
         sys.modules[cls.__module__].require_native(f"{cls.__name__}.__init__")
         options = dict(kwargs)
         machine_type = options.pop("machine_type", "auto")
@@ -261,17 +259,8 @@ class MachineSelector(type):
                 options["transport"] = _TRANSPORT_BY_MACHINE[selection["machine_type"]]
                 result = implementation(*args, **options)
             else:
-                aliases = (
-                    {"num_gpu_timeout_secs": "num_device_timeout_secs"}
-                    if cls.__name__ == "ElasticBuffer"
-                    else {
-                        "num_nvl_bytes": "num_scaleup_bytes",
-                        "num_rdma_bytes": "num_scaleout_bytes",
-                        "allow_nvlink_for_low_latency_mode": "allow_memory_transport_for_low_latency_mode",
-                        "allow_mnnvl": "allow_multinode_memory_transport",
-                    }
-                )
-                options = translate(cls.__init__, (None, *args), options, aliases)
+                # The constructor's compatibility wrapper handles both naming
+                # styles; selection does not reinterpret values or defaults.
                 result = super().__call__(*args, **options)
         result.machine_type = selection["machine_type"]
         result.machine_selection = selection

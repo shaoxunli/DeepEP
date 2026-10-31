@@ -79,6 +79,8 @@ def test_every_declared_operation_fails_before_touching_inputs(name, method):
         if p.default is inspect.Parameter.empty
     ]
     canonical = "get_theoretical_num_compute_units" if method == "get_theoretical_num_sms" else method
+    if method == "get_low_latency_rdma_size_hint":
+        canonical = "get_low_latency_scaleout_size_hint"
     with pytest.raises(NotImplementedError, match=rf"{name}\.{canonical} is not implemented"):
         operation(*args)
 

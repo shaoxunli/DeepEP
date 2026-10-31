@@ -1,9 +1,9 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by nino888 2026
 
-"""Clos V1 configuration with platform-neutral names and explicit old aliases."""
+"""V1 configuration with upstream names and platform-neutral aliases."""
 
-from ._compat import keyword_aliases
+from ._compat import public_keywords
 
 
 class Config:
@@ -44,25 +44,27 @@ class Config:
             object.__getattribute__(self, "_impl"), name.replace("scaleup", "nvl").replace("scaleout", "rdma")
         )
 
-    def get_scaleup_buffer_size_hint(self, hidden_bytes: int, num_ranks: int, num_tokens: int = 8192) -> int:
+    def get_nvl_buffer_size_hint(self, hidden_bytes: int, num_ranks: int, num_tokens: int = 8192) -> int:
         return self._impl.get_nvl_buffer_size_hint(hidden_bytes, num_ranks, num_tokens)
 
-    def get_scaleout_buffer_size_hint(self, hidden_bytes: int, num_ranks: int, /) -> int:
+    def get_rdma_buffer_size_hint(self, hidden_bytes: int, num_ranks: int, /) -> int:
         return self._impl.get_rdma_buffer_size_hint(hidden_bytes, num_ranks)
 
-    get_nvl_buffer_size_hint = get_scaleup_buffer_size_hint
-    get_rdma_buffer_size_hint = get_scaleout_buffer_size_hint
+    get_scaleup_buffer_size_hint = get_nvl_buffer_size_hint
+    get_scaleout_buffer_size_hint = get_rdma_buffer_size_hint
 
 
-Config.__init__ = keyword_aliases(
+Config.__init__ = public_keywords(
     Config.__init__,
     {
         "num_sms": "num_compute_units",
-        "num_aiv": "num_compute_units",
         "num_max_nvl_chunked_send_tokens": "num_max_scaleup_chunked_send_tokens",
         "num_max_nvl_chunked_recv_tokens": "num_max_scaleup_chunked_recv_tokens",
         "num_max_rdma_chunked_send_tokens": "num_max_scaleout_chunked_send_tokens",
         "num_max_rdma_chunked_recv_tokens": "num_max_scaleout_chunked_recv_tokens",
+    },
+    aliases={
+        "num_aiv": "num_compute_units",
         "num_max_shmem_chunked_send_tokens": "num_max_scaleup_chunked_send_tokens",
         "num_max_shmem_chunked_recv_tokens": "num_max_scaleup_chunked_recv_tokens",
     },

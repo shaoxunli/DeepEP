@@ -13,6 +13,7 @@ Modified by Joyce_An 2026
 
 本分支新增全 Clos 机型的 V1/V2 后端，和原有 POD 实现共用 SHMEM。
 自动识别、手动选择及兼容参数见 [机型后端说明](docs/machine_backends.md)。
+公开接口使用 `num_sms` 等上游名称，已有昇腾名称作为兼容别名保留；本项目核数单位仍为 AIV。
 以下 HT/LL/MegaMoE 描述继续对应原有 POD 路径。
 
 ## 最新进展

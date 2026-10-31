@@ -21,11 +21,11 @@ def test_platform_aliases_preserve_source_size_hints_including_sixteen_ranks():
         deep_ep.Config(num_compute_units=20, num_sms=32)
 
 
-def test_selected_clos_api_publishes_ascend_names():
-    assert "num_scaleup_bytes" in inspect.signature(Buffer).parameters
-    assert "num_device_timeout_secs" in inspect.signature(ElasticBuffer).parameters
-    assert "num_compute_units" in inspect.signature(ElasticBuffer.dispatch).parameters
-    assert "num_compute_units" in inspect.signature(ElasticBuffer.combine).parameters
+def test_selected_clos_api_publishes_upstream_names():
+    assert "num_nvl_bytes" in inspect.signature(Buffer).parameters
+    assert "num_gpu_timeout_secs" in inspect.signature(ElasticBuffer).parameters
+    assert "num_sms" in inspect.signature(ElasticBuffer.dispatch).parameters
+    assert "num_sms" in inspect.signature(ElasticBuffer.combine).parameters
 
 
 def test_public_handle_recognizes_both_backend_types_but_pod_checks_remain_specific():

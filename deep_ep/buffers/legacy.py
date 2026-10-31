@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 from .._native import _unavailable, require_native
 from .._runtime import Runtime, runtime_of, warn_unclosed
 from .._machine import MachineSelector
+from .._compat import public_keywords
 
 if TYPE_CHECKING:
     import mpi4py.MPI
@@ -209,3 +210,21 @@ class Buffer(metaclass=MachineSelector):
     def get_next_low_latency_combine_buffer(self, handle: object):
         """Declare Buffer.get_next_low_latency_combine_buffer; execution is not implemented."""
         _unavailable("Buffer.get_next_low_latency_combine_buffer")
+
+
+# Preserve the POD implementation and defaults; only publish upstream names.
+Buffer.__init__ = public_keywords(
+    Buffer.__init__,
+    {
+        "num_nvl_bytes": "num_scaleup_bytes",
+        "num_rdma_bytes": "num_scaleout_bytes",
+        "allow_nvlink_for_low_latency_mode": "allow_memory_transport_for_low_latency_mode",
+        "allow_mnnvl": "allow_multinode_memory_transport",
+    },
+)
+Buffer.dispatch = public_keywords(Buffer.dispatch, {"num_tokens_per_rdma_rank": "num_tokens_per_scaleout_rank"})
+Buffer.set_num_sms = staticmethod(
+    public_keywords(Buffer.set_num_compute_units, {"new_num_sms": "new_num_compute_units"})
+)
+Buffer.set_num_compute_units = Buffer.__dict__["set_num_sms"]
+Buffer.get_low_latency_rdma_size_hint = Buffer.__dict__["get_low_latency_scaleout_size_hint"]

@@ -1,12 +1,12 @@
-"""Platform-named adapters over the pinned Clos V1/V2 implementation."""
+"""Upstream-named interfaces with compatibility aliases over the Clos backend."""
 
 from ascend_deepep.buffer import Buffer as SourceBuffer
 from ascend_deepep.elastic import ElasticBuffer as SourceElasticBuffer
-from ._compat import platform_keywords
+from ._compat import keyword_aliases
 
 
 class Buffer(SourceBuffer):
-    __init__ = platform_keywords(
+    __init__ = keyword_aliases(
         SourceBuffer.__init__,
         {
             "num_scaleup_bytes": "num_nvl_bytes",
@@ -15,24 +15,31 @@ class Buffer(SourceBuffer):
             "allow_multinode_memory_transport": "allow_mnnvl",
         },
     )
-    dispatch = platform_keywords(SourceBuffer.dispatch, {"num_tokens_per_scaleout_rank": "num_tokens_per_rdma_rank"})
-    set_num_compute_units = staticmethod(SourceBuffer.set_num_sms)
+    dispatch = keyword_aliases(SourceBuffer.dispatch, {"num_tokens_per_scaleout_rank": "num_tokens_per_rdma_rank"})
+    set_num_sms = staticmethod(keyword_aliases(SourceBuffer.set_num_sms, {"new_num_compute_units": "new_num_sms"}))
+    set_num_compute_units = set_num_sms
 
 
 class ElasticBuffer(SourceElasticBuffer):
-    __init__ = platform_keywords(SourceElasticBuffer.__init__, {"num_device_timeout_secs": "num_gpu_timeout_secs"})
-    dispatch = platform_keywords(SourceElasticBuffer.dispatch, {"num_compute_units": "num_sms"})
-    combine = platform_keywords(SourceElasticBuffer.combine, {"num_compute_units": "num_sms"})
-    get_theoretical_num_compute_units = platform_keywords(
+    __init__ = keyword_aliases(SourceElasticBuffer.__init__, {"num_device_timeout_secs": "num_gpu_timeout_secs"})
+    dispatch = keyword_aliases(
+        SourceElasticBuffer.dispatch,
+        {"num_compute_units": "num_sms", "use_aligned_col_major_sf": "use_tma_aligned_col_major_sf"},
+    )
+    combine = keyword_aliases(SourceElasticBuffer.combine, {"num_compute_units": "num_sms"})
+    get_theoretical_num_sms = keyword_aliases(
         SourceElasticBuffer.get_theoretical_num_sms,
         {
             "scaleup_gbs": "nvlink_gbs",
             "scaleout_gbs": "rdma_gbs",
             "compute_unit_read_gbs": "sm_read_gbs",
             "compute_unit_write_gbs": "sm_write_gbs",
+            "compute_read_gbs": "sm_read_gbs",
+            "compute_write_gbs": "sm_write_gbs",
         },
     )
-    get_theoretical_num_qps = platform_keywords(
+    get_theoretical_num_compute_units = get_theoretical_num_sms
+    get_theoretical_num_qps = keyword_aliases(
         SourceElasticBuffer.get_theoretical_num_qps, {"num_compute_units": "num_sms"}
     )
 

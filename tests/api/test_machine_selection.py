@@ -142,8 +142,12 @@ def test_backend_is_selected_once_and_constructor_defaults_are_preserved(monkeyp
     monkeypatch.setattr(_machine, "select", lambda *args, **kw: calls.append((args, kw)) or {"machine_type": "pod"})
 
     class ElasticBuffer(metaclass=_machine.MachineSelector):
+        from deep_ep._compat import public_keywords
+
         def __init__(self, group, num_device_timeout_secs=7):
             self.timeout = num_device_timeout_secs
+
+        __init__ = public_keywords(__init__, {"num_gpu_timeout_secs": "num_device_timeout_secs"})
 
         def operation(self):
             return self.timeout
