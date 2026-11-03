@@ -30,8 +30,12 @@ __aicore__ inline void DispatchRemoteImpl(
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
     const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
     const uint32_t fields = td.has_x_scales && scale_bytes ? 2U : 1U;
-    // Lanes own disjoint existing notify channels; destination row order is unchanged.
-    for (uint32_t ch = core % td.udma_workers_per_peer; sender.Count() && ch < td.num_channels; ch += td.udma_workers_per_peer) {
+    const uint32_t lane = core % td.udma_workers_per_peer;
+    const bool weighted = td.udma_cross_lane0_weight != 1;
+    // Default retains channel ownership. Weighted lanes intersect one whole-peer
+    // row partition with each channel, so rounding never resets at a tile boundary.
+    for (uint32_t ch = weighted ? 0U : lane; sender.Count() && ch < td.num_channels;
+         ch += weighted ? 1U : td.udma_workers_per_peer) {
         const uint32_t begin = ch * channel_tokens < td.num_tokens ? ch * channel_tokens : td.num_tokens;
         const uint32_t end = begin + channel_tokens < td.num_tokens ? begin + channel_tokens : td.num_tokens;
         uint32_t row[Capacity]{}, consumed[Capacity]{}, total[Capacity]{};
@@ -41,6 +45,18 @@ __aicore__ inline void DispatchRemoteImpl(
             total[p] = channel_gm.GetValue(peer * td.num_channels + ch) - previous;
             row[p] = (td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0) +
                      (ch ? channel_gm.GetValue(peer * td.num_channels + ch - 1) : 0);
+            if (weighted) {
+                const uint32_t count = channel_gm.GetValue(peer * td.num_channels + td.num_channels - 1);
+                const uint32_t first = PeerRowBoundary(count, lane, td.udma_workers_per_peer,
+                    td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
+                const uint32_t last = PeerRowBoundary(count, lane + 1U, td.udma_workers_per_peer,
+                    td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
+                const uint32_t skip = first > uint32_t(previous) ? first - previous : 0U;
+                consumed[p] = skip < total[p] ? skip : total[p];
+                const uint32_t stop = last > uint32_t(previous) ? last - previous : 0U;
+                total[p] = stop < total[p] ? stop : total[p];
+                row[p] += consumed[p];
+            }
         }
         for (uint32_t start = begin; start < end; start += max_tile) {
             const uint32_t size = end - start < max_tile ? end - start : max_tile;

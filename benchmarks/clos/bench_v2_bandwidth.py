@@ -4,8 +4,8 @@ python benchmarks/clos/bench_v2_bandwidth.py --output ./bandwidth_results
 
 Each dtype/expand/AIV configuration gets a fresh torchrun group. No kernel or
 public API instrumentation is installed. Precision is checked before profiling.
-Both APIs use the default library scheduling policy; this entrypoint exposes
-workload options, not manual scheduling knobs.
+Default runs use the library automatic policy. V2 tuning runs explicitly select
+manual peer ownership and reuse one Buffer across a visit-size sweep.
 Defaults cover BF16/FP8 and expanded/non-expanded operations at 32 AIVs.
 """
 
@@ -55,6 +55,21 @@ def arguments(argv=None, *, description=None):
         description=description or __doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.set_defaults(udma_auto_policy=True)
+    p.add_argument(
+        "--tuning-order",
+        choices=("rank", "group_round_robin"),
+        help="V2 manual sweep; requires contiguous ranks per physical node",
+    )
+    p.add_argument(
+        "--tuning-peers",
+        type=int,
+        choices=(1, 2, 4, 8),
+        default=4,
+        help="peers per owner for rank order; local positions per owner for group_round_robin",
+    )
+    p.add_argument("--tuning-visits", type=int, nargs="+", choices=(4, 8, 16, 32), default=[8, 16, 32])
+    p.add_argument("--tuning-workers", type=int, choices=(1, 2), default=2)
+    p.add_argument("--tuning-cross-lane0-weight", type=int, choices=(1, 3), default=3)
     p.add_argument(
         "--flush-l2-cache",
         action=argparse.BooleanOptionalAction,
@@ -150,6 +165,23 @@ def arguments(argv=None, *, description=None):
                 p.error("multi-node execution needs a reachable node 0 --master-addr, not loopback")
             if not args.run_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.run_id):
                 p.error("multi-node execution needs the same --run-id (1..64 letters/digits/_/-) on all nodes")
+    if args.tuning_order:
+        if "bench_v1" in Path(sys.argv[0]).stem:
+            p.error("manual tuning sweep is currently supported by the V2 entrypoint")
+        if args.tuning_order == "group_round_robin" and args.tuning_peers == 8:
+            p.error("group_round_robin supports 1, 2 or 4 local positions per owner")
+        if args.tuning_workers == 1 and args.tuning_cross_lane0_weight != 1:
+            p.error("3:1 split requires two workers")
+        owners = (
+            (args.ep_size - 2) // args.tuning_peers + 1
+            if args.tuning_order == "rank"
+            else (local_world_size(args) + args.tuning_peers - 1) // args.tuning_peers
+        )
+        if any(owners * args.tuning_workers > min(aiv, 32) for aiv in args.aiv):
+            p.error("manual configuration exceeds the sending-core/QP budget")
+        if len(set(args.tuning_visits)) != len(args.tuning_visits):
+            p.error("duplicate tuning visits")
+        args.udma_auto_policy = False
     return args
 
 
@@ -220,6 +252,19 @@ def worker_command(args, case, path, *, entrypoint=None):
         command.append("--huge-pages")
     command.append("--flush-l2-cache" if args.flush_l2_cache else "--no-flush-l2-cache")
     command += ["--combine-bias", args.combine_bias]
+    if args.tuning_order:
+        command += [
+            "--tuning-order",
+            args.tuning_order,
+            "--tuning-peers",
+            str(args.tuning_peers),
+            "--tuning-workers",
+            str(args.tuning_workers),
+            "--tuning-cross-lane0-weight",
+            str(args.tuning_cross_lane0_weight),
+            "--tuning-visits",
+            *map(str, args.tuning_visits),
+        ]
     return command
 
 
@@ -298,6 +343,7 @@ def effective_udma_config(buffer, config=None, *, num_aiv=None):
             "udma_qps_per_worker",
         )
     }
+    result["udma_cross_lane0_weight"] = getattr(buffer, "udma_cross_lane0_weight", 1)
     policy = buffer.udma_auto_policy
     if policy is not None:
         if num_aiv is None:
@@ -338,6 +384,39 @@ def parse_profile_collective(dist, error_path, *args, **kwargs):
 
 
 def worker(args):
+    if not args.tuning_order:
+        return _worker(args)
+    import torch
+    import torch.distributed as dist
+    from deep_ep.backends.clos.config import Config
+
+    root = args.output.parent
+    base = f"{args.dtypes[0]}_expand{args.expand[0]}_aiv{args.aiv[0]}"
+    destinations = []
+    for visit in args.tuning_visits:
+        args._tuning_visit = visit
+        args.output = root / f"{base}_visit{visit}"
+        if hasattr(args, "_shared_buffer"):
+            args._shared_buffer._udma_config = Config(
+                udma_peers_per_worker=args.tuning_peers, udma_wqes_per_visit=visit
+            )
+        _worker(args)
+        destinations.append(args.output / f"rank{dist.get_rank()}" / "result.json")
+    dist.barrier()
+    args._shared_buffer.destroy()
+    torch.npu.synchronize()
+    # A result is eligible for reporting only after the shared runtime drains/destroys.
+    for path in destinations:
+        result = json.loads(path.read_text())
+        result["destroyed"] = True
+        result["buffer_initializations"] = 1
+        write_json(path, result)
+    rank = dist.get_rank()
+    dist.destroy_process_group()
+    print(f"BATCH_PASSED rank={rank} cases={len(destinations)} buffer_initializations=1", flush=True)
+
+
+def _worker(args):
     # Imports follow argument handling so --help/report-only need no NPU runtime.
     # Use the installed wheel; prepending the checkout can hide its native
     # extensions. Only the independent CPU reference comes from this tree.
@@ -382,17 +461,49 @@ def worker(args):
         )
         write_json(destination / "input_routes.json", routes[rank].tolist())
         torch.npu.set_device(device)
-        dist.init_process_group("gloo", timeout=datetime.timedelta(seconds=args.rendezvous_timeout))
-        buffer = ElasticBuffer(
-            dist.group.WORLD,
-            num_max_tokens_per_rank=args.num_tokens,
-            hidden=args.hidden,
-            num_topk=args.num_topk,
-            use_fp8_dispatch=args.dtype == "fp8",
-            explicitly_destroy=True,
-            transport="udma",
-            use_1g_huge_pages=args.huge_pages,
-        )
+        if not dist.is_initialized():
+            dist.init_process_group("gloo", timeout=datetime.timedelta(seconds=args.rendezvous_timeout))
+        if hasattr(args, "_shared_buffer"):
+            buffer = args._shared_buffer
+        else:
+            tuning = {}
+            if args.tuning_order:
+                # torchrun ranks are node-contiguous; validate physical hosts before treating a node as a group.
+                import socket
+
+                hosts = [None] * args.ep_size
+                dist.all_gather_object(hosts, socket.gethostname())
+                groups = [hosts[i : i + local_world_size(args)] for i in range(0, args.ep_size, local_world_size(args))]
+                if any(len(set(g)) != 1 for g in groups) or len({g[0] for g in groups}) != args.nnodes:
+                    raise ValueError("tuning group size does not describe distinct contiguous physical nodes")
+                tuning = dict(
+                    udma_auto_policy=False,
+                    udma_schedule="peer",
+                    udma_dispatch_peer_order=args.tuning_order,
+                    udma_combine_peer_order=args.tuning_order,
+                    udma_ranks_per_group=local_world_size(args),
+                    udma_peers_per_group_per_worker=args.tuning_peers
+                    if args.tuning_order == "group_round_robin"
+                    else None,
+                    udma_workers_per_peer=args.tuning_workers,
+                    udma_qps_per_worker=1,
+                    udma_peers_per_worker=args.tuning_peers,
+                    udma_wqes_per_visit=args._tuning_visit,
+                    udma_cross_lane0_weight=args.tuning_cross_lane0_weight,
+                )
+            buffer = ElasticBuffer(
+                dist.group.WORLD,
+                num_max_tokens_per_rank=args.num_tokens,
+                hidden=args.hidden,
+                num_topk=args.num_topk,
+                use_fp8_dispatch=args.dtype == "fp8",
+                explicitly_destroy=True,
+                transport="udma",
+                use_1g_huge_pages=args.huge_pages,
+                **tuning,
+            )
+            if args.tuning_order:
+                args._shared_buffer = buffer
         args.effective_udma_config = effective_udma_config(buffer, num_aiv=args.num_aiv)
         if rank == 0:
             print("EFFECTIVE_UDMA_CONFIG", json.dumps(args.effective_udma_config, sort_keys=True), flush=True)
@@ -644,7 +755,8 @@ def worker(args):
         dist.barrier()
         if library_identity(loaded_identity()) != library_identity(identity):
             raise RuntimeError("loaded libraries changed during benchmark")
-        buffer.destroy()
+        if not args.tuning_order:
+            buffer.destroy()
         torch.npu.synchronize()
         write_json(
             destination / "result.json",
@@ -652,7 +764,7 @@ def worker(args):
                 rank=rank,
                 device=device,
                 precision_passed=True,
-                destroyed=True,
+                destroyed=not bool(args.tuning_order),
                 route_counts=counts,
                 identity=identity,
                 operators=operators,
@@ -662,7 +774,8 @@ def worker(args):
                 },
             ),
         )
-        dist.destroy_process_group()
+        if not args.tuning_order:
+            dist.destroy_process_group()
         write_json(destination / "exit.json", dict(code=0, ended=time.time()))
         print(f"CASE_PASSED rank={rank}", flush=True)
     except BaseException:
@@ -737,6 +850,8 @@ def report(root):
                 raise ValueError(f"{rank_dir}: failed rank")
             config = record["config"]
             effective = config.get("effective_udma_config")
+            if "visit" in case and (not effective or effective["udma_wqes_per_visit"] != case["visit"]):
+                raise ValueError("tuning visit does not match the planned case")
             if effective is not None:
                 if case["name"] in effective_configs and effective_configs[case["name"]] != effective:
                     raise ValueError("ranks resolved different effective UDMA configurations")
@@ -1053,6 +1168,23 @@ def run_case(args, case, path, environment, peer, *, entrypoint=None):
         )
         raise
     write_json(path / "launcher_exit.json", dict(code=0, ended=time.time()))
+    if args.tuning_order:
+        publish_tuning_session(path, args.tuning_visits)
+
+
+def publish_tuning_session(first_path, visits):
+    """Every visit cites the same successfully exited launcher, without claiming a new launch."""
+    import shutil
+
+    status = json.loads((first_path / "launcher_exit.json").read_text())
+    if status["code"] != 0 or status.get("suite_aborted"):
+        raise ValueError("cannot publish an incomplete tuning session")
+    base = first_path.name.rsplit("_visit", 1)[0]
+    for visit in visits[1:]:
+        target = first_path.parent / f"{base}_visit{visit}"
+        for name in ("command.json", "resources.before.txt", "run.log"):
+            shutil.copyfile(first_path / name, target / name)
+        write_json(target / "launcher_exit.json", dict(status, shared_session=first_path.name))
 
 
 def launch(args, *, entrypoint=None):
@@ -1086,6 +1218,8 @@ def launch(args, *, entrypoint=None):
         dict(name=f"{dtype}_expand{expand}_aiv{aiv}", dtype=dtype, expand=expand, aiv=aiv)
         for dtype, expand, aiv in itertools.product(args.dtypes, args.expand, args.aiv)
     ]
+    if args.tuning_order:
+        cases = [dict(c, name=f"{c['name']}_visit{v}", visit=v) for c in cases for v in args.tuning_visits]
     api = getattr(args, "api", "v2")
     args.profile_sample_markers = True
     plan = dict(
@@ -1131,17 +1265,20 @@ def launch(args, *, entrypoint=None):
                     )
         for case in cases:
             path = args.output / case["name"]
-            error = None
-            try:
-                path.mkdir()
-                resource = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=30, check=True)
-                (path / "resources.before.txt").write_text(resource.stdout, encoding="utf-8")
-                check_idle(resource.stdout, args.first_device, local_world_size(args))
-            except Exception:
-                error = traceback.format_exc()
-            # Both machines must be ready before either launches NPU workers.
-            require_ready(peer, case["name"] + "/preflight", error)
-            run_case(args, case, path, environment, peer, entrypoint=entrypoint)
+            if not args.tuning_order or case["visit"] == args.tuning_visits[0]:
+                error = None
+                try:
+                    path.mkdir()
+                    resource = subprocess.run(
+                        ["npu-smi", "info"], capture_output=True, text=True, timeout=30, check=True
+                    )
+                    (path / "resources.before.txt").write_text(resource.stdout, encoding="utf-8")
+                    check_idle(resource.stdout, args.first_device, local_world_size(args))
+                except Exception:
+                    error = traceback.format_exc()
+                # Both machines must be ready before either launches NPU workers.
+                require_ready(peer, case["name"] + "/preflight", error)
+                run_case(args, case, path, environment, peer, entrypoint=entrypoint)
             if peer:
                 peer.connection.settimeout(args.collection_timeout)
                 error, manifest = None, None

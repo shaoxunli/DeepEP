@@ -95,6 +95,7 @@ class Buffer:
         udma_workers_per_peer: Optional[int] = None,
         udma_qps_per_worker: Optional[int] = None,
         udma_auto_policy: bool = True,
+        udma_cross_lane0_weight: int = 1,
         use_1g_huge_pages: bool = False,
         shmem_ip_port: Optional[str] = None,
         num_max_tokens_per_rank: Optional[int] = None,
@@ -176,6 +177,16 @@ class Buffer:
             udma_workers_per_peer,
             udma_qps_per_worker,
         )
+        if type(udma_cross_lane0_weight) is not int or udma_cross_lane0_weight not in (1, 3):
+            raise ValueError("udma_cross_lane0_weight must be 1 or 3")
+        if udma_cross_lane0_weight != 1:
+            if udma_auto_policy or udma_workers_per_peer != 2 or udma_qps_per_worker != 1 or not udma_ranks_per_group:
+                raise ValueError(
+                    "3:1 cross lanes require manual mode, two workers, one QP each and an explicit group size"
+                )
+            # Include the immutable split in bootstrap agreement and native construction.
+            peer_options = peer_options[:5] + (udma_qps_per_worker, udma_cross_lane0_weight)
+        self._udma_cross_lane0_weight = udma_cross_lane0_weight
         self._udma_dispatch_peer_order = udma_dispatch_peer_order
         self._udma_combine_peer_order = udma_combine_peer_order
         self._udma_ranks_per_group = udma_ranks_per_group
@@ -252,6 +263,10 @@ class Buffer:
     @property
     def udma_ranks_per_group(self) -> Optional[int]:
         return self._udma_ranks_per_group
+
+    @property
+    def udma_cross_lane0_weight(self) -> int:
+        return self._udma_cross_lane0_weight
 
     @property
     def udma_workers_per_peer(self) -> int:

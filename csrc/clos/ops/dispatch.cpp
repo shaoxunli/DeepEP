@@ -557,6 +557,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.udma_ranks_per_group = shmem.RanksPerGroup();
     tiling.udma_workers_per_peer = shmem.WorkersPerPeer();
     tiling.udma_qps_per_worker = shmem.QpsPerWorker();
+    tiling.udma_cross_lane0_weight = shmem.CrossLane0Weight();
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();

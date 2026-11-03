@@ -41,8 +41,10 @@ __aicore__ inline void CombineRemoteImpl(
         // Split the original peer row interval, retaining src_idx and output addresses.
         const uint32_t begin = row[p], length = end[p] - begin;
         const uint32_t lane = core % td.udma_workers_per_peer;
-        row[p] = begin + uint64_t(length) * lane / td.udma_workers_per_peer;
-        end[p] = begin + uint64_t(length) * (lane + 1U) / td.udma_workers_per_peer;
+        row[p] = begin + PeerRowBoundary(length, lane, td.udma_workers_per_peer,
+            td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
+        end[p] = begin + PeerRowBoundary(length, lane + 1U, td.udma_workers_per_peer,
+            td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
         remaining += end[p] - row[p];
     }
     while (remaining) {

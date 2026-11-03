@@ -37,6 +37,19 @@ ASCEND_DEEPEP_SCHEDULE_FN uint32_t Workers(uint32_t world, uint32_t peers,
         return (ranks_per_group + peers - 1) / peers;
     return (world - 1 + peers - 1) / peers;
 }
+// Split actual peer rows, not input token IDs or WQE counts. The explicit
+// EP-local group size must match the caller's contiguous physical server map.
+// Boundary 0/1/2 gives [0, cut) and [cut, count); empty lanes still signal.
+ASCEND_DEEPEP_SCHEDULE_FN uint32_t PeerRowBoundary(
+    uint32_t count, uint32_t boundary, uint32_t workers, uint32_t rank,
+    uint32_t peer, uint32_t ranks_per_group, uint32_t cross_lane0_weight)
+{
+    if (boundary == 0) return 0;
+    if (boundary >= workers) return count;
+    const uint32_t weight = ranks_per_group && rank / ranks_per_group != peer / ranks_per_group
+        ? cross_lane0_weight : 1U;
+    return uint64_t(count) * weight / (weight + 1U);
+}
 // Token mode partitions channels/return rows across half the AIVs. The other
 // half retains SIMT metadata/self-copy parallelism. QP ownership never depends
 // on whether a worker's assigned token range is empty.

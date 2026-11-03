@@ -88,6 +88,7 @@ struct alignas(8) DispatchTilingData {
     uint32_t udma_token_schedule;
     uint32_t udma_workers_per_peer = 1;
     uint32_t udma_qps_per_worker = 1;
+    uint32_t udma_cross_lane0_weight = 1;
     // Fresh V2 handle outputs; zero for V1 and cached dispatch.
     uint64_t v2_rank_prefix;
     uint64_t v2_expert_prefix;
@@ -133,6 +134,7 @@ struct alignas(8) CombineTilingData {
     uint32_t pipeline_topk;
     uint32_t udma_workers_per_peer = 1;
     uint32_t udma_qps_per_worker = 1;
+    uint32_t udma_cross_lane0_weight = 1;
 };
 
 struct alignas(8) ExpandTilingData {

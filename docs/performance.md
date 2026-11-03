@@ -75,3 +75,39 @@ LL ST 不直接输出逻辑带宽，也不测量完整专家计算。不得将�
 比较结果需保持版本、dtype/量化、负载、拓扑、路由、缓存策略、计时边界和统计方法一致。没有匹配的实测基线就不填写加速比；未测量不填 0。各测试的实际精度判据见[精度说明](precision.md)，不能用统一的“L2 通过”覆盖不同入口。
 
 通用结果格式见[结果说明](../benchmarks/results/README.md)；HT、LL 分别使用各自的 summary、rank 统计和 profiler 文件。MegaMoE 记录完整融合前向，与相同语义的非融合流程比较，不与单独 EP kernel 时间混用。
+
+
+## Experimental Clos dual-worker sweep
+
+The V2 bandwidth entrypoint supports an opt-in manual sweep. Automatic policy
+remains the default. For EP32 on four physical nodes with eight contiguous ranks
+per node, append the following options to the usual matching command on every node:
+
+```bash
+--tuning-order group_round_robin --tuning-peers 1 --tuning-workers 2 --tuning-cross-lane0-weight 3 --tuning-visits 8 16 32
+```
+
+`rank` order interprets `--tuning-peers` as the maximum peer count per owner;
+`group_round_robin` interprets it as local positions per owner across nodes.
+The benchmark validates the physical hostname grouping and sending-core/QP
+budget. Two workers each own one QP. Cross-node actual payload rows are split
+3:1; same-node rows retain 1:1. Weight 1 provides an equal-split control.
+The group size is explicit EP-local topology supplied by this benchmark, not
+physical topology inferred from global rank numbers by the library.
+
+Each immutable mapping gets a fresh runtime. Visit sizes reuse that runtime
+only after the preceding operation has drained. Reports are separated by visit
+size and include effective settings. Results become reportable only after the
+shared Buffer is successfully destroyed. Precision is checked independently for
+every visit size before profiling. Keep the shape, input seed, cache-flush mode,
+and combine alignment identical when comparing strategies.
+
+The split changes ownership only: dispatch intersects whole-peer contiguous
+row intervals with notify channels; combine partitions the corresponding source
+rank interval. Neither changes receive-row addresses, src_idx, GM capacity,
+SHMEM offsets, UB sizes, or output ordering. Existing WQE buffers and their
+HardEvent dependencies are retained. Both lanes publish completion even when
+empty, and all participating AIVs still reach the existing barriers.
+The runtime validates and agrees the split parameter before initialization.
+QP lane numbering alone does not establish physical port placement; verify it
+against the SHMEM SDK used for measurements.

@@ -320,3 +320,96 @@ def test_bandwidth_reports_the_operation_policy_not_the_buffer_default():
         assert effective_udma_config(buffer, num_aiv=32)['udma_peers_per_worker'] == 1
         assert base.peers_per_worker == 1
     """)
+
+
+def test_tuning_arguments_preserve_manual_policy_and_reject_oversubscription():
+    run_host("""
+        sys.path.insert(0, 'benchmarks/clos')
+        from bench_v2_bandwidth import arguments, worker_command
+        from pathlib import Path
+        common = ['--ep-size', '32', '--nnodes', '4', '--master-addr', '192.0.2.1', '--run-id', 'test']
+        a = arguments(common + ['--tuning-order', 'group_round_robin', '--tuning-peers', '1'])
+        assert not a.udma_auto_policy and a.tuning_visits == [8,16,32]
+        cmd = worker_command(a, dict(name='bf16_expand0_aiv32_visit8',aiv=32,dtype='bf16',expand=0), Path('/tmp/test'))
+        assert cmd[cmd.index('--tuning-order')+1] == 'group_round_robin'
+        assert cmd[cmd.index('--tuning-cross-lane0-weight')+1] == '3'
+        for invalid in (['--tuning-order','rank','--tuning-peers','2','--aiv','20'],
+                        ['--tuning-order','rank','--tuning-workers','1'],
+                        ['--tuning-order','group_round_robin','--tuning-peers','8']):
+            try: arguments(common + invalid)
+            except SystemExit as e: assert e.code == 2
+            else: raise AssertionError(invalid)
+        assert arguments(common).udma_auto_policy
+    """)
+
+
+def test_peer_row_split_covers_channel_boundaries(tmp_path):
+    import shutil
+
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    source = tmp_path / "split.cpp"
+    source.write_text(
+        r"""#include "csrc/clos/common/udma_schedule.h"
+#include <cassert>
+#include <cstdint>
+using ascend_deepep::udma::PeerRowBoundary;
+int main() {
+  for (uint32_t count = 0; count < 4096; ++count) {
+    for (uint32_t peer : {1U, 8U, 31U}) {
+      for (uint32_t weight : {1U, 3U}) {
+        uint32_t cut = PeerRowBoundary(count, 1, 2, 0, peer, 8, weight);
+        assert(cut == count * (peer < 8 ? 1 : weight) / (peer < 8 ? 2 : weight + 1));
+        assert(PeerRowBoundary(count, 0, 2, 0, peer, 8, weight) == 0);
+        assert(PeerRowBoundary(count, 2, 2, 0, peer, 8, weight) == count);
+        assert(PeerRowBoundary(count, 1, 1, 0, peer, 8, 1) == count);
+        // Uneven channels and empty tails: intersections exactly tile the whole peer interval.
+        uint32_t hits[4096]{};
+        for (uint32_t lane = 0; lane < 2; ++lane) {
+          uint32_t a = lane ? cut : 0, b = lane ? count : cut;
+          for (uint32_t previous = 0; previous < count; previous += 17) {
+            uint32_t n = count - previous < 17 ? count - previous : 17;
+            uint32_t skip = a > previous ? a - previous : 0;
+            uint32_t consumed = skip < n ? skip : n;
+            uint32_t stop = b > previous ? b - previous : 0;
+            uint32_t total = stop < n ? stop : n;
+            assert(consumed <= total);
+            for (uint32_t i = consumed; i < total; ++i) ++hits[previous + i];
+          }
+        }
+        for (uint32_t i = 0; i < count; ++i) assert(hits[i] == 1);
+      }
+    }
+  }
+}
+""".replace("#include <cassert>", "#include <cassert>\n#include <initializer_list>")
+    )
+    binary = tmp_path / "split"
+    subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(ROOT), str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30)
+
+
+def test_tuning_visits_share_launcher_evidence(tmp_path):
+    run_host(f"""
+        sys.path.insert(0, 'benchmarks/clos')
+        from bench_v2_bandwidth import publish_tuning_session
+        from pathlib import Path
+        import json
+        root = Path({str(tmp_path)!r})
+        first = root / 'bf16_expand0_aiv32_visit8'
+        first.mkdir()
+        (root / 'bf16_expand0_aiv32_visit16').mkdir()
+        for name in ('command.json', 'resources.before.txt', 'run.log'):
+            (first / name).write_text('shared evidence')
+        (first / 'launcher_exit.json').write_text(json.dumps(dict(code=0, ended=123)))
+        publish_tuning_session(first, [8,16])
+        other = root / 'bf16_expand0_aiv32_visit16'
+        assert (other/'run.log').read_text() == 'shared evidence'
+        status = json.loads((other/'launcher_exit.json').read_text())
+        assert status == dict(code=0, ended=123, shared_session=first.name)
+        (first / 'launcher_exit.json').write_text(json.dumps(dict(code=1, ended=123)))
+        try: publish_tuning_session(first, [8,16])
+        except ValueError: pass
+        else: raise AssertionError('failed launcher accepted')
+    """)

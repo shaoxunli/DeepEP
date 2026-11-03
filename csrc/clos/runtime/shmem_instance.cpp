@@ -90,7 +90,7 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
                              bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
-                             int64_t udma_qps_per_worker)
+                             int64_t udma_qps_per_worker, int64_t udma_cross_lane0_weight)
     : rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),
@@ -138,6 +138,11 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
         throw std::invalid_argument(
             "two QPs per worker require shared-Jetty UDMA peer schedule and one worker per peer");
     qps_per_worker_ = static_cast<uint32_t>(udma_qps_per_worker);
+    if (udma_cross_lane0_weight != 1 && udma_cross_lane0_weight != 3)
+        throw std::invalid_argument("udma_cross_lane0_weight must be 1 or 3");
+    if (udma_cross_lane0_weight != 1 && (workers_per_peer_ != 2 || qps_per_worker_ != 1 || ranks_per_group_ == 0))
+        throw std::invalid_argument("weighted cross lanes require two workers, one QP each and an explicit group size");
+    cross_lane0_weight_ = static_cast<uint32_t>(udma_cross_lane0_weight);
     const uint32_t qp_lanes = workers_per_peer_ * qps_per_worker_;
     if (qp_lanes != 1 &&
         (dispatch_peer_order_ != ascend_deepep::udma::kGroupRoundRobinOrder ||
