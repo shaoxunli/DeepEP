@@ -17,8 +17,10 @@ inline constexpr uint32_t kHeadersOffset = kRequestsOffset + kBatchWqes * 4U * s
 inline constexpr uint32_t kSenderScratchBytes = kHeadersOffset + kMaxPeers * 2U * kWqeBytes;
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 inline constexpr aclshmemx_udma_op_config_t kData{0U, 0U, 0U, ACLSHMEMX_UDMA_ODR_RO};
-inline constexpr aclshmemx_udma_op_config_t kLast{1U, 0U, 0U, ACLSHMEMX_UDMA_ODR_RO};
 inline constexpr aclshmemx_udma_op_config_t kDone{1U, 0U, 0U, ACLSHMEMX_UDMA_ODR_SO};
+// The first half holds receive-ready markers; the second half is a private
+// checkpoint sink per source rank and physical QP. Receivers never poll it.
+static_assert(2U * kQpCount * sizeof(uint64_t) <= kSignalBytes);
 
 __aicore__ inline __gm__ uint64_t* Signal(GM_ADDR base, uint64_t offset, uint32_t source)
 {
@@ -36,7 +38,7 @@ __aicore__ inline void Begin(
     GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t world, uint32_t core, uint32_t cores,
     AscendC::LocalTensor<uint64_t> scratch, uint32_t marker_count = 1)
 {
-    if (marker_count > kSignalBytes / sizeof(uint64_t)) { trap(); return; }
+    if (marker_count > kQpCount) { trap(); return; }
     for (uint32_t source = core; source < world; source += cores) {
         for (uint32_t worker = 0; worker < marker_count; ++worker)
             scratch.SetValue(worker, source == rank ? 1U : 0U);
@@ -82,17 +84,19 @@ __simt_vf__ __launch_bounds__(32) inline void BuildWqes(
     wqe[7] = request[1]; // local VA
 }
 
-// Cache only for this kernel invocation. The SDK still owns admission, SQ
-// wrap, publication, and CQ accounting; every short batch requests one CQE.
+// Payload batches are unsignaled. Pressure checkpoints and final SO markers
+// request CQEs; SDK quiet retires them before source buffers can be reused.
 template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1>
 class SenderT {
     static_assert(Qps == 1 || Qps == 2);
 public:
     __aicore__ SenderT(
         uint32_t rank, uint32_t world, uint32_t owner, uint32_t group, __ubuf__ uint8_t* scratch, GM_ADDR workspace,
+        uint64_t completion_offset,
         uint32_t peer_start = UINT32_MAX, uint32_t rotation = 0,
         uint32_t peer_order = kRankOrder, uint32_t ranks_per_group = 0, uint32_t workers_per_peer = 1)
-        : qp_(owner * Qps), qp_base_(owner * Qps), scratch_(scratch), local_base_(reinterpret_cast<uint64_t>(workspace))
+        : qp_(owner * Qps), qp_base_(owner * Qps), scratch_(scratch), local_base_(reinterpret_cast<uint64_t>(workspace)),
+          checkpoint_(Signal(workspace, completion_offset, rank))
     {
         auto* info = aclshmemi_udma_qp_info_fetch();
         if (info->qp_num != kQpCount)
@@ -125,7 +129,7 @@ public:
                     uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kData>(
                     reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers), remote, memory, 0U);
                 aclshmemi_udma_fill_sqe_base_ctx<
-                    uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kLast>(
+                    uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kData>(
                     reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers + kWqeBytes), remote, memory, 0U);
                 peers_[index] = {peer, slot, ctx->state_addr, reinterpret_cast<uint64_t>(remote), ctx};
                 // Independent QP lanes must never alias the same SQ state, even
@@ -153,10 +157,7 @@ public:
             Flush();
         if (!pending_) {
             active_state_ = peers_[p].state;
-            auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(active_state_);
-            aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, kBatchWqes);
-            if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes))
-                trap();
+            EnsurePayloadCredit(p);
         }
         auto* request = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + pending_ * 4U;
         request[0] = peers_[p].remote_base + (reinterpret_cast<uint64_t>(dst) - local_base_);
@@ -180,9 +181,7 @@ public:
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset), pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-        aclshmemi_udma_flush_aggregate_wqes(
-            scratch_, peers_[last_].context, peers_[last_].slot, qp_, EVENT_ID5, pending_, kWqeBytes);
-        // SDK MTE3_S completion drains WQE reads before scratch/requests reuse.
+        SubmitPayload(pending_);
         pending_ = 0;
     }
     __aicore__ void Publish(GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t worker = 0)
@@ -213,6 +212,44 @@ public:
     }
 
 protected:
+    __aicore__ void EnsurePayloadCredit(uint32_t p)
+    {
+        auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(peers_[p].state);
+        // Admit a whole batch plus one SO before overwriting any SQ slot.
+        // A checkpoint may overwrite scratch only before a new batch is built.
+        if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes + 1U)) {
+            aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kDone>(
+                checkpoint_ + kQpCount + qp_, checkpoint_, reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
+                1U, peers_[p].peer, qp_, EVENT_ID5);
+            aclshmemx_udma_qp_quiet(peers_[p].peer, qp_);
+            if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes + 1U)) trap();
+        }
+    }
+
+    __aicore__ void SubmitPayload(uint32_t count)
+    {
+        auto* ctx = peers_[last_].context;
+        auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(ctx->state_addr);
+        const uint32_t head = state->sq_head;
+        const uint32_t index = head % ctx->depth;
+        const uint32_t first = count < ctx->depth - index ? count : ctx->depth - index;
+        AscendC::LocalTensor<uint8_t> view;
+        view.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
+        view.address_.bufferAddr = reinterpret_cast<uint64_t>(scratch_);
+        aclshmemi_udma_copy_wqe_from_ub(
+            reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * kWqeBytes),
+            view, first * kWqeBytes, EVENT_ID5);
+        if (first != count) {
+            view.address_.bufferAddr = reinterpret_cast<uint64_t>(scratch_ + first * kWqeBytes);
+            aclshmemi_udma_copy_wqe_from_ub(
+                reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view, (count - first) * kWqeBytes, EVENT_ID5);
+        }
+        // Both ring spans are complete and UB is reusable before publication.
+        // The aggregate helper cannot be used: it counts a data CQE that this
+        // unsignaled batch does not request. Payload completion still needs SO.
+        aclshmemi_udma_post_send_update_info(head + count, ctx, state);
+    }
+
     // Caller must flush its WQE/span builder before switching lanes.
     __aicore__ void SelectQp(uint32_t lane) { qp_ = qp_base_ + lane; }
     __aicore__ uint32_t QueuePeer(uint32_t p) const { return (qp_ - qp_base_) * Capacity + p; }
@@ -220,6 +257,7 @@ protected:
     uint32_t qp_, qp_base_, count_ = 0, pending_ = 0;
     __ubuf__ uint8_t* scratch_;
     uint64_t local_base_, active_state_ = 0;
+    __gm__ uint64_t* checkpoint_;
     uint32_t last_ = 0;
 };
 

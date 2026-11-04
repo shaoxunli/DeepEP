@@ -390,6 +390,108 @@ int main() {
     subprocess.run([str(binary)], check=True, timeout=30)
 
 
+def test_unsignaled_payload_wrap_and_pressure_checkpoint(tmp_path):
+    """Execute the sender methods against bounded queues, including shared SQs."""
+    import shutil
+    from tests.utils.cpp import cpp_functions
+
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    sender = (ROOT / "csrc/clos/kernels/common/udma_shared_sender.h").read_text()
+    methods = cpp_functions(sender, "EnsurePayloadCredit", "SubmitPayload").replace("protected:", "public:")
+    source = tmp_path / "sender.cpp"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
+#define __aicore__
+#define __gm__
+#define __ubuf__
+constexpr uint32_t kBatchWqes=32, kQpCount=32, kWqeBytes=64, EVENT_ID5=5;
+constexpr int PIPE_MTE3=0, kDone=1;
+struct aclshmemi_udma_queue_state_t { uint32_t sq_head=0, sq_tail=0, cqe_cnt=0, cq_tail=0; };
+struct aclshmemi_udma_wq_ctx_t { uint64_t state_addr, buf_addr; uint32_t depth=128; };
+namespace AscendC {
+enum class TPosition { VECOUT };
+template<class T> struct LocalTensor { struct { uint8_t logicPos; uint64_t bufferAddr; } address_; };
+}
+struct Peer { uint32_t peer; uint64_t state; aclshmemi_udma_wq_ctx_t* context; };
+aclshmemi_udma_queue_state_t queues[2];
+uint64_t flags[64];
+unsigned checkpoints=0, quiets=0, copies=0, doors=0;
+bool aclshmemi_udma_sq_has_credit(aclshmemi_udma_queue_state_t* q, uint32_t n) {
+    return uint32_t(q->sq_head+n-q->sq_tail)+4 < 128;
+}
+void trap() { throw std::runtime_error("credit failure"); }
+template<class T, int Pipe, const int& Config>
+void aclshmemx_udma_qp_put_nbi(T* dst, T* src, uint64_t* scratch, uint32_t n, uint32_t peer, uint32_t qp, uint32_t) {
+    assert(Config==kDone && n==1 && peer<3 && qp<2);
+    assert(dst==flags+kQpCount+qp && src==flags);
+    auto& q=queues[qp];
+    assert(aclshmemi_udma_sq_has_credit(&q,1));
+    ++q.sq_head; ++q.cqe_cnt; ++checkpoints;
+    *dst=*src; scratch[0]=0xDEAD; // SDK scratch reuse before payload construction.
+}
+void aclshmemx_udma_qp_quiet(uint32_t, uint32_t qp) {
+    auto& q=queues[qp];
+    assert(q.cqe_cnt!=q.cq_tail);
+    q.sq_tail=q.sq_head; q.cq_tail=q.cqe_cnt; ++quiets;
+}
+void aclshmemi_udma_copy_wqe_from_ub(uint8_t* dst, AscendC::LocalTensor<uint8_t>& v, uint32_t n, uint32_t) {
+    assert(n && n%kWqeBytes==0);
+    std::memcpy(dst,reinterpret_cast<void*>(v.address_.bufferAddr),n); ++copies;
+}
+void aclshmemi_udma_post_send_update_info(uint32_t head, aclshmemi_udma_wq_ctx_t*, aclshmemi_udma_queue_state_t* q) {
+    assert(copies>doors); q->sq_head=head; ++doors;
+}
+struct Sender {
+    Peer peers_[3]; uint32_t last_=0, qp_=0; uint8_t* scratch_; uint64_t* checkpoint_=flags;
+"""
+        + methods
+        + r"""
+};
+int main() {
+    alignas(32) uint8_t scratch[32*64]{}, rings[2][128*64]{};
+    aclshmemi_udma_wq_ctx_t ctx[2]{{reinterpret_cast<uint64_t>(&queues[0]),reinterpret_cast<uint64_t>(rings[0])},
+                                 {reinterpret_cast<uint64_t>(&queues[1]),reinterpret_cast<uint64_t>(rings[1])}};
+    Sender s{{{1,reinterpret_cast<uint64_t>(&queues[0]),&ctx[0]},
+              {2,reinterpret_cast<uint64_t>(&queues[0]),&ctx[0]},
+              {1,reinterpret_cast<uint64_t>(&queues[1]),&ctx[1]}},0,0,scratch};
+    // Same SQ shared by two peers; independent second QP. Force ring wrap and
+    // uint32_t producer-counter wrap, with different short and full batches.
+    queues[0].sq_head=queues[0].sq_tail=126;
+    queues[1].sq_head=queues[1].sq_tail=UINT32_MAX-15;
+    flags[0]=1;
+    unsigned split_copies=0;
+    for (unsigned i=0;i<300;++i) {
+        s.last_=i%3; s.qp_=s.last_==2?1:0;
+        auto& q=queues[s.qp_];
+        s.EnsurePayloadCredit(s.last_);
+        auto head=q.sq_head, cq=q.cqe_cnt;
+        uint32_t n=i%5?32:3;
+        for (uint32_t j=0;j<n*64;++j) scratch[j]=uint8_t(i+j);
+        auto before=copies;
+        s.SubmitPayload(n);
+        split_copies+=copies-before==2;
+        assert(q.sq_head==uint32_t(head+n) && q.cqe_cnt==cq);
+        for (uint32_t j=0;j<n;++j)
+            assert(!std::memcmp(rings[s.qp_]+((head+j)%128)*64,scratch+j*64,64));
+        // Pressure SOs never announce terminal receive readiness.
+        for (unsigned j=1;j<kQpCount;++j) assert(flags[j]==0);
+    }
+    assert(split_copies && checkpoints && checkpoints<100 && quiets==checkpoints && doors==300);
+}
+"""
+    )
+    binary = tmp_path / "sender"
+    subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30)
+
+
 def test_tuning_visits_share_launcher_evidence(tmp_path):
     run_host(f"""
         sys.path.insert(0, 'benchmarks/clos')

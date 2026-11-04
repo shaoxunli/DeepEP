@@ -71,7 +71,7 @@ public:
         GM_ADDR scales, uint32_t peer_start = UINT32_MAX, uint32_t rotation = 0)
         : Base(td.rank, td.world_size, core,
               peer_start == UINT32_MAX ? td.udma_peers_per_worker : kMaxPeers,
-              reinterpret_cast<__ubuf__ uint8_t*>(scratch.GetPhyAddr()), workspace, peer_start, rotation, td.udma_peer_order, td.udma_ranks_per_group,
+              reinterpret_cast<__ubuf__ uint8_t*>(scratch.GetPhyAddr()), workspace, td.udma_completion_signal_offset, peer_start, rotation, td.udma_peer_order, td.udma_ranks_per_group,
               peer_start == UINT32_MAX ? td.udma_workers_per_peer : 1U),
           td_(td),
           x_(reinterpret_cast<uint64_t>(x)),
@@ -135,10 +135,7 @@ public:
             Flush();
         if (!rows_pending_) {
             active_state_ = peers_[p].state;
-            auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(active_state_);
-            aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, kBatchWqes);
-            if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes))
-                trap();
+            Base::EnsurePayloadCredit(p);
         }
         const uint32_t n = count < kBatchWqes - rows_pending_ ? count : kBatchWqes - rows_pending_;
         auto* span = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + spans_ * 4U;
@@ -170,8 +167,7 @@ public:
             rows_pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-        aclshmemi_udma_flush_aggregate_wqes(
-            scratch_, peers_[last_].context, peers_[last_].slot, qp_, EVENT_ID5, rows_pending_, kWqeBytes);
+        Base::SubmitPayload(rows_pending_);
         rows_pending_ = 0;
         spans_ = 0;
     }
