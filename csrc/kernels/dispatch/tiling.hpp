@@ -33,6 +33,8 @@ inline constexpr uint64_t DispatchPlanBytes(uint32_t world, uint32_t tokens, uin
 }
 struct DispatchTiling {
     uint32_t dedup_group_size = 8U;
+    // Private BF16 benchmark: only cross-server primary rows are valid output.
+    uint32_t cross_server_only = 0U;
     // Framework-owned live GM buffers. Payload addresses are absolute virtual addresses,
     // never symmetric-heap offsets and never passed through aclshmem_ptr.
     uint64_t input_address = 0;

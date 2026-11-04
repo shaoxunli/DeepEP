@@ -17,9 +17,15 @@ __aicore__ inline void WaitDispatchIncoming(GM_ADDR workspace, const DispatchTil
     // ranks. There are no self or unused-lane notifications to wait for.
     const uint32_t starts[6] = {
         0U, local_end, t.world, t.world + local_end, 2U * t.world + local_begin, 2U * t.world + t.rank + 1U};
-    const uint32_t lengths[6] = {local_begin,         t.world - local_end,  local_begin,
-                                 t.world - local_end, t.rank - local_begin, local_end - t.rank - 1U};
-    const uint32_t expected = 2U * (t.world - (local_end - local_begin)) + local_end - local_begin - 1U;
+    // Benchmark mode skips FM payload, so those senders publish no terminal flag.
+    const uint32_t lengths[6] = {local_begin,
+                                 t.world - local_end,
+                                 local_begin,
+                                 t.world - local_end,
+                                 t.cross_server_only ? 0U : t.rank - local_begin,
+                                 t.cross_server_only ? 0U : local_end - t.rank - 1U};
+    const uint32_t expected =
+        2U * (t.world - (local_end - local_begin)) + (t.cross_server_only ? 0U : local_end - local_begin - 1U);
     const uint64_t begin = GetSystemCycle();
     // At most 36 batches for supported EP <= 512. A sender cannot overwrite a
     // completed slot until this rank publishes its next descriptor generation.

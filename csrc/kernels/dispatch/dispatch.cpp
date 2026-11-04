@@ -537,18 +537,18 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
             if (t.world > 8U) RunClosRelayAssist<Profile>(s, copy);
         } else if (core >= 8U && core < local_first) {
             if (t.world > 8U) DispatchClosSplitQp<Profile>(p, wqe, copy, slots);
-        } else if (core < 7U) {
+        } else if (!t.cross_server_only && core < 7U) {
             if (core + 1U < s.lanes) {
                 const uint32_t peer = t.rank / 8U * 8U + (t.rank % 8U + core + 1U) % s.lanes;
                 EnsureDeepepPeerAddress(s, peer);
             }
             DispatchDeepepLocalPeer<Profile>(p, wqe, slots, profile);
 
-        } else {
+        } else if (!t.cross_server_only) {
             DispatchDeepepLocalCopy(p, wqe, copy, slots);
         }
         DispatchProfileMark<Profile>(profile, 4U);
-        if (core < 7U || core >= local_first) {
+        if (!t.cross_server_only && (core < 7U || core >= local_first)) {
             if (core < 7U)
                 ForwardPeer<Profile, false>(s, t, forward, counts, copy, slots, wqe);
             else
@@ -556,7 +556,9 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
         }
         DispatchProfileMark<Profile>(profile, 5U);
     }
-    // Retire local work and acquire all incoming terminal notifications before
+    // Cross-server benchmarks retain the split-QP helper ACK, final CQE/quiet,
+    // and remote terminal flags. Skipped FM/local output rows remain undefined.
+    // Retire local work and acquire the required incoming notifications before
     // the stream event can release a consumer. No collective barrier kernel.
     DispatchProfileMark<Profile>(profile, 6U);
     DrainDispatchStores<Profile>(t, detail.data());

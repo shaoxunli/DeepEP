@@ -157,6 +157,43 @@ Combine 的 `--local-expert-first` 将 top-k 中属于源 rank 的专家稳定�
 
 `--tokens-list`、`--chunk-tokens-list` 在一次初始化中遍历多个 shape；Notify 可用 `--notify-num-cores` 选择 32/64 核，Dispatch 用例的 `--notify-only --notify-num-cores-list 32 64` 只测 Notify。各 rank 必须使用相同配置。
 
+## POD 跨 server 传输测量
+
+现有 `test_dispatch.py` 的 `--cross-server-only` 模式仅运行 BF16 hidden 的跨 server
+primary 发送，不执行同 server payload 搬运或后续转发展开，也不传 weight。
+它保留原有双 QP 分配、发送计划、WQE 调度和完整收发完成协议；所有节点需要重新编译安装。
+该模式通过私有 native 入口运行，部分输出不会生成可供 Combine 使用的公开 handle。
+
+EP32 使用四台 POD 主机，每台 8 卡。各节点设置相同的 `MASTER_ADDR`、不同的
+`NODE_RANK=0..3`，在仓库根目录执行（输出目录须不存在）：
+
+```bash
+export DEEPEP_SHMEM_ENDPOINT="tcp://${MASTER_ADDR}:19091"
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+python -u tests/elastic/test_dispatch.py \
+  --ep-size 32 --nproc-per-node 8 --node-rank "$NODE_RANK" \
+  --master-addr "$MASTER_ADDR" --master-port 19090 \
+  --tokens 8192 --hidden 6144 --topk 8 --experts 1024 \
+  --dtype bf16 --route random --without-replacement --seed 20260823 \
+  --server-dedup --repeat 3 --cross-server-only \
+  --profile-op dispatch --profile-warmup 10 --profile-iters 30 \
+  --output "pod_cross_ep32_node${NODE_RANK}_001" \
+  2>&1 | tee "pod_cross_ep32_node${NODE_RANK}_001.log"
+```
+
+Notify、输出分配和正确性检查均在计时外。默认不清理 L2，默认采样前插入设备 barrier，
+该 barrier 不计入 Dispatch kernel 耗时。64 个 AIV 的启动配置不变。
+每个 rank 的 `rank-<rank>.json` 和 profiler `summary.json` 记录实际发送字节数、
+每个 peer/QP 的发送行数、接收字节数、逐次 kernel 耗时和 `cross_server_send_GBps`：
+
+`GB/s = 跨 server 实际发送行数 × hidden × 2 / (平均 kernel 耗时[μs] × 1000)`。
+
+发送行数来自 Notify 的两阶段、两 QP 发送目录，并与独立 CPU 路由参考对照。
+分母包含地址发布、跨 server 收发和完成等待；这是每个 rank 的有效发送带宽，
+不等于网口线上速率，也不是全 EP 带宽。正常 Dispatch 的输出展开和权重不在本次测量内。
+测试会更换输入反复校验 primary 行，并检查其他行仍为哨兵值；空路由可用
+`--route empty` 验证无 payload 时的完成协议。该模式支持 EP>=16 的 server 去重路径。
+
 ## HT peer-table 检查与计时
 
 [run_peer_table_check.py](elastic/run_peer_table_check.py) 检查 BF16/FP8 dispatch 的路由和搬运结果，并提供独立计时入口。沿用前述 HT 的设备和 endpoint 设置，例如：

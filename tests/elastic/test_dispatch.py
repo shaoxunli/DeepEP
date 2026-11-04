@@ -23,6 +23,7 @@ import time
 import traceback
 import runpy
 import random
+import struct
 
 
 _ROUTES = ("normal", "random", "duplicates", "invalid", "empty", "hotspot")
@@ -1507,7 +1508,7 @@ def capture_calls(profiler, invoke, synchronize, warmup, iterations, log):
     return last
 
 
-def profile_operator(args, rank, scenario, invoke, validate, build_info, log, *, stream=None):
+def profile_operator(args, rank, scenario, invoke, validate, build_info, log, *, stream=None, extra_metadata=None):
     """Capture rank-local kernel durations after warmup."""
     import torch
     import torch_npu
@@ -1538,6 +1539,7 @@ def profile_operator(args, rank, scenario, invoke, validate, build_info, log, *,
         build_info=build_info,
     )
     toolkit = Path(os.environ.get("ASCEND_HOME_PATH", "/nonexistent"))
+    metadata.update(extra_metadata or {})
     metadata["cann_version_files"] = {
         str(path): path.read_text(encoding="utf-8", errors="replace")
         for path in (toolkit / "version.cfg", toolkit / "version.info")
@@ -1568,6 +1570,8 @@ def profile_operator(args, rank, scenario, invoke, validate, build_info, log, *,
     validate(last)
     summary = read_kernel_summary(directory, args.profile_op, args.profile_iters)
     summary.update(metadata, precision_checked=True)
+    if metadata.get("cross_server_only"):
+        summary["cross_server_send_GBps"] = metadata["cross_server_send_bytes"] / (summary["avg_us"] * 1000)
     (directory / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     log(
         f"profile kernel={summary['kernel']} samples={summary['samples']} avg_us={summary['avg_us']:.3f} "
@@ -1576,6 +1580,340 @@ def profile_operator(args, rank, scenario, invoke, validate, build_info, log, *,
     if "prepare" in summary:
         log(f"profile combine_prepare_kernel avg_us={summary['prepare']['avg_us']:.3f} excluded_from_combine=1")
     return summary
+
+
+def cross_server_reference(routes, experts, rank):
+    """Independent expert-order reference; one primary row per remote server/token."""
+    world, local = len(routes), experts // len(routes)
+    totals = [0] * experts
+    for source in routes:
+        for route in source:
+            for expert in route:
+                if 0 <= expert < experts:
+                    totals[expert] += 1
+    bases, rank_rows = [], [0] * world
+    for expert, count in enumerate(totals):
+        peer = expert // local
+        bases.append(rank_rows[peer])
+        rank_rows[peer] += count
+    cursors, sent, received = [0] * experts, [], []
+    for source, tokens in enumerate(routes):
+        for token, route in enumerate(tokens):
+            seen = set()
+            for slot, expert in enumerate(route):
+                if not 0 <= expert < experts:
+                    continue
+                peer = expert // local
+                row = bases[expert] + cursors[expert]
+                cursors[expert] += 1
+                server = peer // 8
+                if server == source // 8 or server in seen:
+                    continue
+                seen.add(server)
+                if source == rank:
+                    sent.append((peer, token, row))
+                if peer == rank:
+                    received.append((row, source, token, slot))
+    return rank_rows, sent, received
+
+
+def cross_server_plan_rows(plan, rank, world, tokens, topk):
+    """Decode both phases and both QPs of Notify's version-3 peer directory."""
+    header = struct.unpack_from("<16I", plan)
+    if header[4] != 3 or header[5] != world * 4 or header[7] != 8:
+        raise ValueError("Unsupported POD dispatch peer plan; rebuild matching benchmark and wheel")
+    rows_offset = (64 + world * 32 + 511) // 512 * 512
+    sent, counts = [], [[0, 0] for _ in range(world)]
+    for phase in range(2):
+        for peer in range(world):
+            if peer // 8 == rank // 8:
+                continue
+            for qp in range(2):
+                begin, count = struct.unpack_from("<II", plan, 64 + (phase * world + peer) * 16 + qp * 8)
+                if begin + count > tokens * topk:
+                    raise ValueError("Peer plan exceeds row capacity")
+                counts[peer][qp] += count
+                for at in range(begin, begin + count):
+                    token, row = struct.unpack_from("<ii", plan, rows_offset + at * 8)
+                    if not 0 <= token < tokens or row < 0:
+                        raise ValueError("Invalid peer-plan row")
+                    sent.append((peer, token, row))
+    return sent, counts
+
+
+def test_cross_server_reference_and_plan():
+    import pytest
+
+    # Two experts on rank 8, plus another rank on the same remote server:
+    # only the first occurrence crosses the server boundary.
+    routes = [[[-1, -1, -1, -1]] for _ in range(32)]
+    routes[0][0] = [16, 17, 18, 48]
+    routes[1][0] = [16, 16, -1, 64]
+    routes[8][0] = [0, 1, 2, 16]
+    rows, sent, received = cross_server_reference(routes, 64, 0)
+    assert sent == [(8, 0, 0), (24, 0, 0)]
+    assert received == [(0, 8, 0, 0)]
+    assert rows[0] == 2 and rows[8] == 5
+    golden = build_notify_golden(routes, 64, 256, rank_dedup=False)
+    assert rows == golden["rank_rows"]
+    for rank in range(32):
+        _, outgoing, _ = cross_server_reference(routes, 64, rank)
+        decoded = []
+        for at, destination in enumerate(golden["plans"][rank]["dst"]):
+            if destination >= 0:
+                peer, row = divmod(destination, golden["address_stride"])
+                if peer // 8 != rank // 8:
+                    decoded.append((peer, at // 4, row))
+        assert outgoing == decoded
+    # Exercise both phases/QPs and exclusion of local directories.
+    world, tokens, topk = 32, 1, 4
+    offset = (64 + world * 32 + 511) // 512 * 512
+    plan = bytearray(offset + tokens * topk * 8)
+    struct.pack_into("<4I", plan, 16, 3, world * 4, 0, 8)
+    struct.pack_into("<II", plan, 64 + 8 * 16, 0, 1)
+    struct.pack_into("<II", plan, 64 + (world + 24) * 16 + 8, 1, 1)
+    struct.pack_into("<II", plan, 64 + 1 * 16, 2, 1)
+    struct.pack_into("<6i", plan, offset, 0, 0, 0, 0, 0, 99)
+    actual, counts = cross_server_plan_rows(plan, 0, world, tokens, topk)
+    assert actual == sent and counts[8] == [1, 0] and counts[24] == [0, 1]
+    assert counts[1] == [0, 0]
+    struct.pack_into("<II", plan, 64 + 8 * 16, 4, 1)
+    with pytest.raises(ValueError, match="capacity"):
+        cross_server_plan_rows(plan, 0, world, tokens, topk)
+    empty = [[[-1]] for _ in range(16)]
+    assert cross_server_reference(empty, 16, 0) == ([0] * 16, [], [])
+
+
+def test_cross_server_cli(monkeypatch, tmp_path):
+    import pytest
+
+    calls = []
+    monkeypatch.setattr(sys.modules[__name__], "_launch", lambda args, worker: calls.append(args))
+    argv = [
+        "test_dispatch.py",
+        "--ep-size",
+        "32",
+        "--dtype",
+        "bf16",
+        "--route",
+        "random",
+        "--profile-op",
+        "dispatch",
+        "--cross-server-only",
+        "--server-dedup",
+        "--output",
+        str(tmp_path),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+    assert calls[0].cross_server_only and not calls[0].rank_dedup
+    for flag, value in (("--ep-size", "8"), ("--dtype", "fp8"), ("--profile-op", "notify"), ("--route", "all")):
+        invalid = argv.copy()
+        invalid[invalid.index(flag) + 1] = value
+        monkeypatch.setattr(sys, "argv", invalid)
+        with pytest.raises(SystemExit):
+            main()
+    assert len(calls) == 1
+
+
+def test_cross_server_incoming_wait(tmp_path):
+    import shutil
+    import subprocess
+    import pytest
+    from tests.utils.cpp import cpp_functions
+
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("Requires a host C++ compiler")
+    root = Path(__file__).resolve().parents[2]
+    body = cpp_functions((root / "csrc/kernels/dispatch/completion_wait.hpp").read_text(), "WaitDispatchIncoming")
+    code = (
+        r"""
+#include <cstdint>
+#include <cassert>
+#include <vector>
+#include <algorithm>
+#define __aicore__
+using GM_ADDR = uint8_t*;
+struct DispatchTiling { uint32_t rank, world, cross_server_only; uint64_t done=0, generation=23; };
+uint32_t core=7;
+uint32_t GetBlockIdx() { return core; }
+uint64_t GetSystemCycle() { return 0; }
+constexpr uint64_t kDispatchCompletionTimeoutCycles = 100;
+void PauseDispatchCompletionPoll() {}
+void aclshmemi_kernel_abort(const char*, ...) { assert(false); }
+void trap() { assert(false); }
+enum class MemDsbT { DDR };
+template <MemDsbT> void DataSyncBarrier() {}
+std::vector<uint32_t> observed;
+uint8_t* base;
+namespace DispatchAggregatePacket {
+constexpr uint32_t kPollBlocks=32;
+uint32_t ReadyCount(uint8_t* start, uint32_t count, uint64_t generation, int&) {
+    assert(generation == 23);
+    for (uint32_t i=0;i<count;++i) observed.push_back((start-base)/512+i);
+    return count;
+}
+}
+"""
+        + body
+        + r"""
+int main() {
+  for (uint32_t world : {16U,32U,64U,128U,256U,512U}) {
+    std::vector<uint8_t> workspace(world*3*512);
+    base=workspace.data(); int scratch=0;
+    for (uint32_t rank=0;rank<world;++rank) for(uint32_t cross : {0U,1U}) {
+      DispatchTiling t{rank,world,cross}; observed.clear(); core=7;
+      WaitDispatchIncoming(base,t,scratch);
+      std::vector<uint32_t> expected;
+      for(uint32_t peer=0;peer<world;++peer) {
+        if(peer/8!=rank/8) { expected.push_back(peer); expected.push_back(world+peer); }
+        else if(!cross && peer!=rank) expected.push_back(2*world+peer);
+      }
+      std::sort(observed.begin(),observed.end()); std::sort(expected.begin(),expected.end());
+      assert(observed==expected);
+      for(core=0;core<64;++core) if(core!=7) {
+        observed.clear(); WaitDispatchIncoming(base,t,scratch); assert(observed.empty());
+      }
+    }
+  }
+}
+"""
+    )
+    source, binary = tmp_path / "wait.cpp", tmp_path / "wait"
+    source.write_text(code)
+    subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
+def cross_server_benchmark(buffer, args, routes, rank, info, log):
+    """Private native entry: partial output never becomes a public dispatch handle."""
+    import torch
+    from deep_ep._native import require_native
+    from deep_ep._runtime import runtime_of
+
+    native, runtime = require_native("cross-server dispatch benchmark"), runtime_of(buffer)
+    if getattr(native, "dispatch_cross_server_benchmark_version", lambda: 0)() != 1:
+        raise RuntimeError("Rebuild/install the cross-server benchmark wheel on every rank")
+    world = args.ep_size
+    rank_rows, sent, received = cross_server_reference(routes, args.experts, rank)
+    specification = native.notify_layout(rank, world, args.tokens, args.topk, args.experts, 256)
+    if specification["workspace_bytes"] > runtime.capacity // 2:
+        raise ValueError("Notify exceeds benchmark workspace")
+    native.notify_check_mapping(runtime.native)
+    with torch.npu.stream(runtime.stream):
+        indices = torch.tensor(routes[rank], dtype=torch.int64, device="npu")
+        metadata = {
+            name: torch.empty(shape, dtype=getattr(torch, dtype), device="npu")
+            for name, (shape, dtype) in specification["tensors"].items()
+        }
+        native.notify(
+            runtime.native,
+            indices,
+            metadata,
+            args.tokens,
+            args.topk,
+            args.experts,
+            runtime.stream.npu_stream,
+            rank_dedup=False,
+        )
+    runtime.stream.synchronize()
+    if metadata["rank_rows"].cpu().tolist() != rank_rows:
+        raise AssertionError("Notify receive counts differ from independent reference")
+    actual, qp_rows = cross_server_plan_rows(
+        metadata["_peer_plan"].cpu().numpy().tobytes(), rank, world, args.tokens, args.topk
+    )
+    if sorted(actual) != sorted(sent):
+        raise AssertionError("Cross-server send plan differs from independent routing reference")
+    send_bytes = len(actual) * args.hidden * 2
+    row_indices = torch.tensor([r[0] for r in received], dtype=torch.int64)
+    entries = [r[1:] for r in received]
+    untouched = torch.ones(rank_rows[rank], dtype=torch.bool)
+    untouched[row_indices] = False
+    with torch.npu.stream(runtime.stream):
+        x = torch.empty((args.tokens, args.hidden), dtype=torch.bfloat16, device="npu")
+        output = torch.empty((rank_rows[rank], args.hidden), dtype=torch.bfloat16, device="npu")
+    tensors = dict(
+        plan=metadata["_peer_plan"],
+        input=x,
+        output=output,
+        dst=metadata["dst"],
+        forward_list=metadata["forward_list"],
+        forward_counts=metadata["forward_counts"],
+        weights=None,
+        output_weights=None,
+        scales=None,
+        output_scales=None,
+        cross_server_only=True,
+        benchmark_entry_barrier=args.dispatch_barrier,
+    )
+
+    def invoke():
+        with torch.npu.stream(runtime.stream):
+            native.dispatch(
+                runtime.native,
+                tensors,
+                args.tokens,
+                args.topk,
+                args.experts,
+                max(1, max(rank_rows)),
+                rank_rows[rank],
+                False,
+                runtime.stream.npu_stream,
+            )
+        return output
+
+    def validate(result):
+        runtime.stream.synchronize()
+        cpu = result.cpu()
+        assert_bytes(cpu.index_select(0, row_indices), expected, "cross-server primary rows")
+        if not bool((cpu[untouched] == sentinel).all()):
+            raise AssertionError("Cross-server benchmark wrote a local/secondary output row")
+
+    # Vary input and poison output between completed calls. This catches stale
+    # generations, missing receives, unintended local writes and unsafe reuse.
+    for generation in range(args.repeat):
+        local, _ = payload(rank, args.tokens, generation, False, args.hidden)
+        expected, _, _ = expected_payload(
+            routes, args.experts, rank, generation, False, entries=entries, width=args.hidden
+        )
+        sentinel = -128 - generation
+        with torch.npu.stream(runtime.stream):
+            x.copy_(local)
+            output.fill_(sentinel)
+        validate(invoke())
+        log(f"cross-server correctness {generation + 1}/{args.repeat} passed send_bytes={send_bytes}")
+    if expected.numel():
+        corrupt = expected.clone()
+        corrupt.view(torch.uint8).flatten()[0] ^= 1
+        try:
+            assert_bytes(output.cpu().index_select(0, row_indices), corrupt, "deliberate corruption")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("Cross-server comparator missed deliberate corruption")
+    summary = profile_operator(
+        args,
+        rank,
+        f"{args.route}-bf16-cross-server-only",
+        invoke,
+        validate,
+        info,
+        log,
+        stream=runtime.stream,
+        extra_metadata=dict(
+            cross_server_only=True,
+            cross_server_send_bytes=send_bytes,
+            cross_server_receive_bytes=len(received) * args.hidden * 2,
+            cross_server_rows_by_peer_qp=qp_rows,
+            launch_aivs=64,
+            checks=args.repeat,
+            bandwidth_scope="rank-local cross-server hidden send bytes / mean dispatch kernel us / 1000",
+            timing_scope="address publication + cross-server send/receive + completion; excludes Notify and entry barrier",
+        ),
+    )
+    (args.output / f"rank-{rank}.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    log(f"cross-server send_GBps={summary['cross_server_send_GBps']:.3f} avg_us={summary['avg_us']:.3f}")
 
 
 def notify_profile_call(buffer, handle, experts):
@@ -1654,12 +1992,27 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     add_profile_args(parser, ("notify", "dispatch"))
     add_dispatch_barrier_arg(parser)
+    parser.add_argument(
+        "--cross-server-only",
+        action="store_true",
+        help="POD BF16 primary transfers only; no local forwarding, no weights, partial output",
+    )
     args = parser.parse_args()
     _profile["resolve_dedup_args"](args)
     if args.rank_dedup and args.ep_size not in (8, 16):
         parser.error("Rank-deduplicated Dispatch supports EP8/16")
     _profile["validate_random_route_args"](parser, args)
     validate_profile_args(parser, args)
+    if args.cross_server_only and (
+        args.ep_size < 16
+        or args.dtype != "bf16"
+        or args.rank_dedup
+        or args.route == "all"
+        or args.profile_op != "dispatch"
+    ):
+        parser.error(
+            "--cross-server-only requires EP>=16, --dtype bf16, one --route, server dedup and --profile-op dispatch"
+        )
     if not 0 < args.hidden <= 7168 or args.hidden % (16 if args.dtype == "bf16" else 128):
         parser.error("hidden must be <=7168 and divisible by 16 (BF16) or 128 (FP8)")
     if not __debug__ or os.environ.get("PYTHONOPTIMIZE") or args.repeat < 2:
@@ -1723,11 +2076,29 @@ def worker(local_rank, args):
         hidden=args.hidden,
         num_topk=args.topk,
         explicitly_destroy=True,
+        **({"machine_type": "pod"} if args.cross_server_only else {}),
     )
     log("buffer.init.done")
     buffer._notify_rank_dedup = args.rank_dedup
     checks, previous_output = 0, None
     try:
+        if args.cross_server_only:
+            routes = (
+                random_routes
+                if random_routes is not None
+                else make_routes(
+                    world,
+                    args.tokens,
+                    args.topk,
+                    args.experts,
+                    0,
+                    args.route,
+                    seed=args.seed,
+                    without_replacement=getattr(args, "without_replacement", False),
+                )
+            )
+            cross_server_benchmark(buffer, args, routes, rank, info, log)
+            return
         for mode in modes:
             log(f"route={mode} routes_and_notify_golden.begin (CPU)")
             routes = (

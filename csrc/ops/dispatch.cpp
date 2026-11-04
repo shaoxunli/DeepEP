@@ -79,6 +79,7 @@ void bind_dispatch(py::module_& module)
         py::arg("rank"), py::arg("world"), py::arg("tokens"), py::arg("topk"), py::arg("experts"), py::arg("rows"),
         py::arg("fp8"), py::arg("weights") = false, py::arg("hidden") = 7168);
     module.def("dispatch_plan_bytes", &ascend_deepep::DispatchPlanBytes);
+    module.def("dispatch_cross_server_benchmark_version", [] { return 1; });
     module.def("dispatch", [](Session& session, py::dict tensors, int tokens, int topk, int experts, int rows,
                               int local_rows, bool fp8, uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("Dispatch requires combine_only=False");
@@ -112,11 +113,17 @@ void bind_dispatch(py::module_& module)
         }
         auto stream = reinterpret_cast<aclrtStream>(stream_address);
         auto config = t;
+        config.cross_server_only = tensors.contains("cross_server_only") && tensors["cross_server_only"].cast<bool>();
+        if (config.cross_server_only && (session.world() <= 8 || fp8 || weights)) {
+            throw std::invalid_argument("Cross-server benchmark requires EP>=16, BF16 and no weights");
+        }
         if (tensors.contains("dedup_group_size")) {
             config.dedup_group_size = tensors["dedup_group_size"].cast<uint32_t>();
             if (config.dedup_group_size != 1U && config.dedup_group_size != 8U)
                 throw std::invalid_argument("Dispatch dedup_group_size must be 1 or 8");
         }
+        if (config.cross_server_only && config.dedup_group_size != 8U)
+            throw std::invalid_argument("Cross-server benchmark requires server deduplication");
         config.input_address = reinterpret_cast<uint64_t>(input);
         config.output_address = reinterpret_cast<uint64_t>(output);
         config.output_weights_address = reinterpret_cast<uint64_t>(out_weights);
