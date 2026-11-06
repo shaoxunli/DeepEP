@@ -24,25 +24,24 @@ constexpr uint32_t kCombineUdmaWqeScratchBytes =
 // One tile uses 14 bytes per element: two BF16/FP16 input slots, two FP32
 // workspaces, and one BF16/FP16 output. Keep the tile on a 64-element vector
 // repeat boundary and consume the available UB on each architecture.
-constexpr uint32_t kCombineChunkElements = kCombineUbBytes / (14U * 64U) * 64U;
+constexpr uint32_t kCombineWeightSlotBytes = kCombineMaxTopk * sizeof(float);
+constexpr uint32_t kCombineChunkElements = (kCombineUbBytes - 3U * kCombineWeightSlotBytes) / (14U * 64U) * 64U;
 constexpr uint32_t kCombineInputBufferNum = 2;
 constexpr uint32_t kCombineInputOffset = 0;
-constexpr uint32_t kCombineInputBufferBytes = kCombineChunkElements * sizeof(bfloat16_t);
+constexpr uint32_t kCombineInputBufferBytes = kCombineChunkElements * sizeof(bfloat16_t) + kCombineWeightSlotBytes;
 constexpr uint32_t kCombineTemporaryOffset = kCombineInputOffset + kCombineInputBufferNum * kCombineInputBufferBytes;
 constexpr uint32_t kCombineFloatChunkBytes = kCombineChunkElements * sizeof(float);
 constexpr uint32_t kCombineAccumulatorOffset = kCombineTemporaryOffset + kCombineFloatChunkBytes;
 constexpr uint32_t kCombineOutputOffset = kCombineAccumulatorOffset + kCombineFloatChunkBytes;
-constexpr uint32_t kCombineOutputBytes = kCombineInputBufferBytes;
-constexpr uint32_t kCombineTopkInputOffset = 0;
-constexpr uint32_t kCombineTopkInputBufferBytes = kCombineMaxTopk * sizeof(float);
-constexpr uint32_t kCombineTopkAccumulatorOffset = kCombineTopkInputOffset + kCombineTopkInputBufferBytes;
+constexpr uint32_t kCombineOutputBytes = kCombineChunkElements * sizeof(bfloat16_t);
+constexpr uint32_t kCombineWeightAccumulatorOffset = kCombineOutputOffset + kCombineOutputBytes;
 constexpr uint32_t kCombineDtypeBfloat16 = 0;
 constexpr uint32_t kCombineDtypeFloat16 = 1;
 
 
 
 static_assert(kCombineOutputOffset + kCombineOutputBytes <= kCombineUbBytes);
-static_assert(kCombineTopkAccumulatorOffset + kCombineTopkInputBufferBytes <= kCombineUbBytes);
+static_assert(kCombineWeightAccumulatorOffset + kCombineWeightSlotBytes <= kCombineUbBytes);
 static_assert(kCombineSrcIdxTileElements * sizeof(int32_t) % kCombineAlignmentBytes == 0);
 static_assert(kCombineUdmaWqeScratchBytes < kCombineUbBytes);
 
@@ -266,6 +265,12 @@ __aicore__ inline void V1CombineUdmaImpl(
         const int32_t token_begin = CombineMin(core_idx * tokens_per_channel, num_tokens);
         const int32_t token_end = CombineMin(token_begin + tokens_per_channel, num_tokens);
 
+        const bool weighted = tiling.has_topk_weights != 0;
+        const int32_t aligned_topk = CombineAlignUpElements(num_topk, 8);
+        auto weight_sum = resource.template GetBufferByByte<float>(kCombineWeightAccumulatorOffset);
+        if (weighted) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID5);
+        }
         int32_t input_buffer_idx = 0;
         // EVENT_ID0/1 protect the two GM-to-UB input slots. EVENT_ID2 protects
         // the independent output slot while the next token is accumulated.
@@ -273,6 +278,11 @@ __aicore__ inline void V1CombineUdmaImpl(
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
         for (int32_t token = token_begin; token < token_end; ++token) {
+            if (weighted) {
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID5);
+                AscendC::Duplicate(weight_sum, 0.0F, aligned_topk);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
             for (int32_t hidden_begin = 0; hidden_begin < hidden; hidden_begin += kCombineChunkElements) {
                 const int32_t hidden_count = CombineMin(static_cast<int32_t>(kCombineChunkElements), hidden - hidden_begin);
                 const int32_t aligned_hidden_count = CombineAlignUpElements(hidden_count, 16);
@@ -315,9 +325,21 @@ __aicore__ inline void V1CombineUdmaImpl(
                     AscendC::DataCopyPad(
                         input_bytes_ub, contributor_gm[static_cast<uint64_t>(hidden_begin) * tiling.x_element_bytes],
                         contributor_copy_params, uint8_pad_params);
+                    const bool read_weight = weighted && contributor >= 0 && hidden_begin + hidden_count == hidden;
+                    auto weight_bytes = input_bytes_ub[CombineAlignUp32(hidden_chunk_bytes)];
+                    if (read_weight) {
+                        const uint64_t slot = static_cast<uint64_t>(contributor) * token_capacity + token;
+                        AscendC::DataCopyExtParams weight_copy(1, topk_weights_row_bytes, 0, 0, 0);
+                        AscendC::DataCopyPad(weight_bytes, local_shmem_gm[tiling.topk_weights_buffer_offset +
+                            slot * tiling.topk_weights_row_stride], weight_copy, uint8_pad_params);
+                    }
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(input_event_id);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(input_event_id);
                     AscendC::Cast(temporary_ub, input_ub, AscendC::RoundMode::CAST_NONE, aligned_hidden_count);
+                    if (read_weight) {
+                        AscendC::Add(weight_sum, weight_sum, weight_bytes.template ReinterpretCast<float>(), aligned_topk);
+                        AscendC::PipeBarrier<PIPE_V>();
+                    }
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(input_event_id);
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Add(accumulator_ub, accumulator_ub, temporary_ub, aligned_hidden_count);
@@ -337,54 +359,19 @@ __aicore__ inline void V1CombineUdmaImpl(
                     output_bytes_ub, output_copy_params);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
             }
+            if (weighted) {
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+                AscendC::DataCopyExtParams weight_copy(1, topk_weights_row_bytes, 0, 0, 0);
+                AscendC::DataCopyPad(recv_topk_weights_gm[token * num_topk], weight_sum, weight_copy);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID5);
+            }
         }
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
 
-        if (tiling.has_topk_weights != 0) {
-            // X reduction is drained, so top-k reduction also starts at UB offset 0.
-            AscendC::LocalTensor<uint8_t> weight_input_bytes_ub =
-                resource.template GetBufferByByte<uint8_t>(kCombineTopkInputOffset);
-            AscendC::LocalTensor<float> weight_input_ub = weight_input_bytes_ub.ReinterpretCast<float>();
-            AscendC::LocalTensor<float> weight_accumulator_ub =
-                resource.template GetBufferByByte<float>(kCombineTopkAccumulatorOffset);
-            const int32_t aligned_num_topk = CombineAlignUpElements(num_topk, 8);
-            // EVENT_ID3 protects the single input buffer; EVENT_ID5 protects output.
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID5);
-
-            for (int32_t token = token_begin; token < token_end; ++token) {
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID5);
-                AscendC::Duplicate(weight_accumulator_ub, 0.0F, aligned_num_topk);
-                AscendC::PipeBarrier<PIPE_V>();
-
-                for (int32_t contributor = 0; contributor < world_size; ++contributor) {
-                    if (send_head_gm.GetValue(token * world_size + contributor) < 0) {
-                        continue;
-                    }
-                    const uint64_t local_slot = static_cast<uint64_t>(contributor) * token_capacity + token;
-                    AscendC::DataCopyExtParams weight_copy_params(1, topk_weights_row_bytes, 0, 0, 0);
-                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
-                    AscendC::DataCopyPad(
-                        weight_input_bytes_ub,
-                        local_shmem_gm[tiling.topk_weights_buffer_offset + local_slot * tiling.topk_weights_row_stride],
-                        weight_copy_params, uint8_pad_params);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
-                    AscendC::Add(weight_accumulator_ub, weight_accumulator_ub, weight_input_ub, aligned_num_topk);
-                    // The next contributor reads the accumulator on PIPE_V.
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
-                }
-
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-                AscendC::DataCopyExtParams weight_output_params(1, topk_weights_row_bytes, 0, 0, 0);
-                AscendC::DataCopyPad(recv_topk_weights_gm[token * num_topk], weight_accumulator_ub, weight_output_params);
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID5);
-            }
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
+        if (weighted) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID5);
         }
     }
