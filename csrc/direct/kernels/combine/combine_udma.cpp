@@ -60,6 +60,26 @@ __aicore__ inline int32_t CombineAlignUpElements(int32_t value, int32_t alignmen
     return (value + alignment - 1) / alignment * alignment;
 }
 
+// Consume the previously issued load while MTE2 fills the other input slot.
+template <typename T>
+__aicore__ inline void AccumulateCombineSlot(
+    AscendC::LocalTensor<uint8_t> inputs, AscendC::LocalTensor<float> temporary,
+    AscendC::LocalTensor<float> accumulator, AscendC::LocalTensor<float> weight_sum,
+    int32_t slot, int32_t hidden_count, uint32_t weight_offset, int32_t aligned_topk, bool has_weight)
+{
+    const auto event = slot == 0 ? EVENT_ID0 : EVENT_ID1;
+    auto input = inputs[slot * kCombineInputBufferBytes];
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(event);
+    AscendC::Cast(temporary, input.ReinterpretCast<T>(), AscendC::RoundMode::CAST_NONE, hidden_count);
+    if (has_weight) {
+        AscendC::Add(weight_sum, weight_sum, input[weight_offset].ReinterpretCast<float>(), aligned_topk);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(event);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Add(accumulator, accumulator, temporary, hidden_count);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
 template <typename T, bool DoCommunication = true, bool DoReduction = true, uint32_t Phase = 0>
 __aicore__ inline void V1CombineUdmaImpl(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
@@ -291,6 +311,9 @@ __aicore__ inline void V1CombineUdmaImpl(
                 AscendC::Duplicate(accumulator_ub, 0.0F, aligned_hidden_count);
                 AscendC::PipeBarrier<PIPE_V>();
 
+                int32_t pending_slot = -1;
+                bool pending_weight = false;
+                const uint32_t weight_offset = CombineAlignUp32(hidden_chunk_bytes);
                 for (int32_t contributor = -2; contributor < world_size; ++contributor) {
                     __gm__ uint8_t* contributor_ptr = nullptr;
                     if (contributor == -2) {
@@ -316,34 +339,26 @@ __aicore__ inline void V1CombineUdmaImpl(
 
                     AscendC::GlobalTensor<uint8_t> contributor_gm;
                     contributor_gm.SetGlobalBuffer(contributor_ptr);
-                    AscendC::DataCopyExtParams contributor_copy_params(1, hidden_chunk_bytes, 0, 0, 0);
-                    const auto input_event_id = input_buffer_idx == 0 ? EVENT_ID0 : EVENT_ID1;
-                    AscendC::LocalTensor<uint8_t> input_bytes_ub =
-                        input_pingpong_bytes_ub[input_buffer_idx * kCombineInputBufferBytes];
-                    AscendC::LocalTensor<T> input_ub = input_bytes_ub.ReinterpretCast<T>();
-                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(input_event_id);
-                    AscendC::DataCopyPad(
-                        input_bytes_ub, contributor_gm[static_cast<uint64_t>(hidden_begin) * tiling.x_element_bytes],
-                        contributor_copy_params, uint8_pad_params);
                     const bool read_weight = weighted && contributor >= 0 && hidden_begin + hidden_count == hidden;
-                    auto weight_bytes = input_bytes_ub[CombineAlignUp32(hidden_chunk_bytes)];
-                    if (read_weight) {
-                        const uint64_t slot = static_cast<uint64_t>(contributor) * token_capacity + token;
-                        AscendC::DataCopyExtParams weight_copy(1, topk_weights_row_bytes, 0, 0, 0);
-                        AscendC::DataCopyPad(weight_bytes, local_shmem_gm[tiling.topk_weights_buffer_offset +
-                            slot * tiling.topk_weights_row_stride], weight_copy, uint8_pad_params);
+                    const uint32_t bytes = read_weight ? weight_offset + topk_weights_row_bytes : hidden_chunk_bytes;
+                    AscendC::DataCopyExtParams copy(1, bytes, 0, 0, 0);
+                    const auto event = input_buffer_idx == 0 ? EVENT_ID0 : EVENT_ID1;
+                    auto input = input_pingpong_bytes_ub[input_buffer_idx * kCombineInputBufferBytes];
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(event);
+                    AscendC::DataCopyPad(input, contributor_gm[static_cast<uint64_t>(hidden_begin) * tiling.x_element_bytes],
+                                         copy, uint8_pad_params);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(event);
+                    if (pending_slot >= 0) {
+                        AccumulateCombineSlot<T>(input_pingpong_bytes_ub, temporary_ub, accumulator_ub, weight_sum,
+                            pending_slot, aligned_hidden_count, weight_offset, aligned_topk, pending_weight);
                     }
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(input_event_id);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(input_event_id);
-                    AscendC::Cast(temporary_ub, input_ub, AscendC::RoundMode::CAST_NONE, aligned_hidden_count);
-                    if (read_weight) {
-                        AscendC::Add(weight_sum, weight_sum, weight_bytes.template ReinterpretCast<float>(), aligned_topk);
-                        AscendC::PipeBarrier<PIPE_V>();
-                    }
-                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(input_event_id);
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Add(accumulator_ub, accumulator_ub, temporary_ub, aligned_hidden_count);
-                    input_buffer_idx = (input_buffer_idx + 1) & 1;
+                    pending_slot = input_buffer_idx;
+                    pending_weight = read_weight;
+                    input_buffer_idx ^= 1;
+                }
+                if (pending_slot >= 0) {
+                    AccumulateCombineSlot<T>(input_pingpong_bytes_ub, temporary_ub, accumulator_ub, weight_sum,
+                        pending_slot, aligned_hidden_count, weight_offset, aligned_topk, pending_weight);
                 }
 
                 AscendC::PipeBarrier<PIPE_V>();

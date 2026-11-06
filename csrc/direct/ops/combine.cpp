@@ -80,11 +80,16 @@ CombineWorkspaceLayout MakeCombineWorkspaceLayout(int64_t base_offset, int64_t w
     // a slower rank's previous payload/notify workspace.
     const int64_t udma_completion_signal_offset = use_udma ? 0 : payload_end;
     const int64_t end_offset = payload_end;
+    // Pack weighted UDMA contributions at the destination. The two producers
+    // retain their independent source tensors and share a stride, not an address.
+    const bool packed = use_udma && topk_weights_row_bytes > 0;
+    TORCH_CHECK(bytes_per_rank_token <= std::numeric_limits<uint32_t>::max(),
+                "combine slot stride must fit uint32 tiling");
     return {token_capacity,
-            x_row_stride,
-            topk_weights_row_stride,
+            packed ? bytes_per_rank_token : x_row_stride,
+            packed ? bytes_per_rank_token : topk_weights_row_stride,
             base_offset,
-            base_offset + x_buffer_bytes,
+            base_offset + (packed ? x_row_stride : x_buffer_bytes),
             udma_completion_signal_offset,
             end_offset - base_offset,
             end_offset};
