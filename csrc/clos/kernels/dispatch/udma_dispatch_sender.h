@@ -84,7 +84,7 @@ template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1>
 class DispatchSenderT : public SenderT<Capacity, Qps> {
     using Base = SenderT<Capacity, Qps>;
     using Base::scratch_; using Base::count_; using Base::peers_; using Base::qp_;
-    using Base::active_state_; using Base::last_;
+    using Base::active_state_; using Base::last_; using Base::qp_base_;
     static constexpr uint32_t kDispatchBasesOffset = kHeadersOffset + Capacity * Qps * 2U * kWqeBytes;
     static constexpr uint32_t kDispatchEpochOffset = kDispatchBasesOffset + Capacity * Qps * kOutputRecordBytes;
     static constexpr uint32_t kCacheOffset = kDispatchEpochOffset + 32;
@@ -101,6 +101,15 @@ public:
           scales_(reinterpret_cast<uint64_t>(scales)), profile_(profile),
           cache_enabled_((td.dispatch_experiment_flags & kDispatchWqeCache) != 0)
     {
+        if (Tracing()) for (uint32_t lane = 0; lane < Qps; ++lane)
+            for (uint32_t i = 0; i < count_; ++i) {
+                const uint32_t p = lane * Capacity + i;
+                for (uint32_t w = 0; w < kTraceSendWords; ++w) trace_[p][w] = 0;
+                trace_[p][0] = peers_[p].peer; trace_[p][1] = qp_base_ + lane;
+                uint32_t alias = 0;
+                while (alias < i && peers_[lane * Capacity + alias].state != peers_[p].state) ++alias;
+                trace_[p][11] = lane * Capacity + alias;
+            }
         auto* bases = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset);
         if (!td.udma_output_control) {
             // Internal staging baseline. Native UDMA calls require the
@@ -171,6 +180,7 @@ public:
         span[3] = rows_pending_;
         ++spans_;
         rows_pending_ += n;
+        TraceRows(p, n);
         last_ = p;
         if (rows_pending_ == kBatchWqes)
             Flush();
@@ -206,6 +216,16 @@ public:
         }
         const uint64_t submitted = Now();
         Base::SubmitPayload(rows_pending_);
+        if (Tracing()) {
+            const uint64_t at = profile_->Elapsed();
+            for (uint32_t lane = 0; lane < Qps; ++lane) for (uint32_t i = 0; i < count_; ++i) {
+                const uint32_t p = lane * Capacity + i;
+                if (!(trace_pending_[p / 32] & (1U << (p % 32)))) continue;
+                if (!trace_[p][7]) trace_[p][2] = at;
+                trace_[p][3] = at; ++trace_[p][7];
+            }
+            for (auto& bits : trace_pending_) bits = 0;
+        }
         if (profile_ && profile_->enabled) {
             profile_->Add(profile_->submit_ns, submitted);
             profile_->wqes += rows_pending_;
@@ -230,15 +250,59 @@ public:
     __aicore__ void Publish(GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t worker = 0)
     {
         Flush();
-        Base::Publish(base, offset, rank, worker);
+        if (!Tracing()) { Base::Publish(base, offset, rank, worker); return; }
+        for (uint32_t lane = 0; lane < Qps; ++lane) {
+            auto* one = Signal(base, offset, rank) + worker * Qps + lane;
+            for (uint32_t i = 0; i < count_; ++i) {
+                const uint32_t p = lane * Capacity + i;
+                aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kDone>(one, one,
+                    reinterpret_cast<__ubuf__ uint64_t*>(scratch_), 1U, peers_[p].peer, qp_base_ + lane, EVENT_ID5);
+                trace_[p][4] = profile_->Elapsed();
+            }
+        }
+    }
+    __aicore__ void Quiet() {
+        if (!Tracing()) { Base::Quiet(); return; }
+        for (uint32_t lane = 0; lane < Qps; ++lane) for (uint32_t i = 0; i < count_; ++i) {
+            const uint32_t p = lane * Capacity + i;
+            const uint32_t alias = trace_[p][11];
+            if (alias == p) {
+                const uint64_t start = Now();
+                aclshmemx_udma_qp_quiet(peers_[p].peer, qp_base_ + lane);
+                trace_[p][5] = profile_->Elapsed(); trace_[p][10] = Now() - start;
+            } else { trace_[p][5] = trace_[alias][5]; trace_[p][10] = trace_[alias][10]; }
+        }
+    }
+    __aicore__ void StoreTrace(uint64_t output, uint32_t core, AscendC::LocalTensor<uint64_t> scratch) const {
+        if (!Tracing()) return;
+        AscendC::GlobalTensor<uint64_t> out;
+        out.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(output) + uint64_t(core) * profile_->Stride());
+        for (uint32_t lane = 0; lane < Qps; ++lane) for (uint32_t i = 0; i < count_; ++i) {
+            for (uint32_t w = 0; w < kTraceSendWords; ++w) scratch.SetValue(w, trace_[lane * Capacity + i][w]);
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
+            AscendC::DataCopyPad(out[kDispatchProfileWords + (lane * count_ + i) * kTraceSendWords], scratch,
+                AscendC::DataCopyExtParams{1, kTraceSendWords * uint32_t(sizeof(uint64_t)), 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
+        }
     }
 
 private:
+    __aicore__ bool Tracing() const { return profile_ && profile_->trace; }
+    __aicore__ void TraceRows(uint32_t p, uint32_t n) {
+        if (!Tracing()) return;
+        trace_[p][6] += n; trace_pending_[p / 32] |= 1U << (p % 32);
+    }
     __aicore__ uint64_t Now() const { return profile_ ? profile_->Now() : 0; }
     __aicore__ void Credit(uint32_t p) {
         const uint64_t started = Now();
-        Base::EnsurePayloadCredit(p);
-        if (profile_) profile_->Add(profile_->credit_ns, started);
+        const bool pressure = Base::EnsurePayloadCredit(p);
+        if (profile_ && profile_->enabled) {
+            profile_->Add(profile_->credit_ns, started);
+            ++profile_->credit_checks; profile_->credit_stalls += pressure;
+        }
+        if (Tracing() && pressure) { ++trace_[p][8]; trace_[p][9] += Now() - started; }
     }
     struct CacheEntry {
         uint64_t next_indices = 0;
@@ -296,6 +360,7 @@ private:
         span[3] = rows_pending_;
         ++spans_;
         rows_pending_ += n;
+        TraceRows(p, n);
         cache_readers_ |= 1U << slot;
         entry.cursor += n;
         entry.next_indices += uint64_t((field + n) / fields) * sizeof(int32_t);
@@ -309,6 +374,8 @@ private:
     uint64_t x_, scales_;
     DispatchProfile* profile_;
     bool cache_enabled_;
+    uint64_t trace_[Capacity * Qps][kTraceSendWords];
+    uint32_t trace_pending_[(Capacity * Qps + 31) / 32]{};
     CacheEntry cache_[kDispatchCacheEntries]{};
     uint32_t cache_readers_ = 0;
     uint32_t rows_pending_ = 0, spans_ = 0;

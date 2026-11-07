@@ -2,12 +2,23 @@
 
 #include "kernel_operator.h"
 #include "common/types.h"
+#include "common/udma_schedule.h"
 
 namespace ascend_deepep::udma {
 // Diagnostic counters are per AIV and per invocation. Each AIV writes its own
 // GM row. Nested sender counters must not be added to send_ns.
 struct DispatchProfile {
+    __aicore__ explicit DispatchProfile(bool active) : enabled(active) {}
     bool enabled;
+    bool trace = false;
+    uint32_t rank = 0, world = 0, cores = 0, markers = 0, qps = 0;
+    uint64_t origin_cycle = 0, remote_wait_ns = 0, local_sync_ns = 0;
+    uint64_t credit_checks = 0, credit_stalls = 0, send_records = 0;
+    uint64_t first_poll[kTraceMaxIncoming], ready_poll[kTraceMaxIncoming], poll_count[kTraceMaxIncoming];
+    __aicore__ uint32_t Stride() const {
+        return trace ? DispatchTraceStride(world, cores, markers, qps) : kDispatchProfileWords;
+    }
+    __aicore__ uint64_t Elapsed() const { return Now() - origin_cycle; }
     uint64_t begin_ns = 0, metadata_ns = 0, setup_ns = 0, plan_ns = 0, send_ns = 0;
     uint64_t build_ns = 0, credit_ns = 0, submit_ns = 0, publish_ns = 0;
     uint64_t incoming_ns = 0, quiet_ns = 0, barrier_ns = 0;
@@ -30,15 +41,34 @@ struct DispatchProfile {
         scratch.SetValue(10, quiet_ns); scratch.SetValue(11, barrier_ns);
         scratch.SetValue(12, refills); scratch.SetValue(13, hits);
         scratch.SetValue(14, wqes); scratch.SetValue(15, batches);
-        for (uint32_t i = 16; i < kDispatchProfileWords; ++i) scratch.SetValue(i, 0);
+        scratch.SetValue(16, origin_cycle); scratch.SetValue(17, remote_wait_ns);
+        scratch.SetValue(18, local_sync_ns); scratch.SetValue(19, credit_checks);
+        scratch.SetValue(20, credit_stalls);
+        scratch.SetValue(21, send_records);
+        for (uint32_t i = 22; i < kDispatchProfileWords; ++i) scratch.SetValue(i, 0);
         AscendC::GlobalTensor<uint64_t> out;
-        out.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(output) + uint64_t(core) * kDispatchProfileWords);
+        out.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(output) + uint64_t(core) * Stride());
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
         AscendC::DataCopyPad(out, scratch,
             AscendC::DataCopyExtParams{1, kDispatchProfileWords * uint32_t(sizeof(uint64_t)), 0, 0, 0});
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
+        if (!trace) return;
+        for (uint32_t item = core; item < world * markers; item += cores) {
+            if (item / markers == rank) continue;
+            const uint32_t slot = item / cores;
+            scratch.SetValue(0, item / markers); scratch.SetValue(1, item % markers);
+            scratch.SetValue(2, first_poll[slot]); scratch.SetValue(3, ready_poll[slot]);
+            scratch.SetValue(4, poll_count[slot]);
+            for (uint32_t i = 5; i < kTraceReceiveWords; ++i) scratch.SetValue(i, 0);
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
+            AscendC::DataCopyPad(out[kDispatchProfileWords + world * qps * kTraceSendWords + slot * kTraceReceiveWords],
+                scratch, AscendC::DataCopyExtParams{1, kTraceReceiveWords * uint32_t(sizeof(uint64_t)), 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
+        }
     }
 };
 } // namespace ascend_deepep::udma

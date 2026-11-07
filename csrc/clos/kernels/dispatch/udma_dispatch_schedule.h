@@ -10,6 +10,58 @@ constexpr uint32_t kListsOffset = kDispatchSenderBytes;
 static_assert(kListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 1024);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 
+// Independent peer cursors retain existing row ownership and completion.
+template <uint32_t Capacity, class Sender, class Prefix>
+__aicore__ inline void DispatchPeerCursors(Sender& sender, const DispatchTilingData& td, uint32_t core,
+    const __gm__ int32_t* plan, Prefix& rank_gm, Prefix& channel_gm, uint32_t plan_stride, uint32_t fields)
+{
+    struct Cursor { uint32_t channel, pos, end, row, field; bool loaded; };
+    Cursor cursor[Capacity];
+    const uint32_t lane = core % td.udma_workers_per_peer;
+    const bool weighted = td.udma_cross_lane0_weight != 1;
+    const uint32_t step = weighted ? 1U : td.udma_workers_per_peer;
+    for (uint32_t p = 0; p < sender.Count(); ++p)
+        cursor[p] = {weighted ? 0U : lane, 0, 0, 0, 0, false};
+    bool active = true;
+    while (active) {
+        active = false;
+        for (uint32_t p = 0; p < sender.Count(); ++p) {
+            auto& c = cursor[p];
+            const uint32_t peer = sender.Rank(p);
+            while (c.channel < td.num_channels && (!c.loaded || c.pos == c.end)) {
+                if (c.loaded) c.channel += step;
+                if (c.channel >= td.num_channels) break;
+                const uint32_t previous = c.channel ? channel_gm.GetValue(peer * td.num_channels + c.channel - 1) : 0;
+                const uint32_t count = channel_gm.GetValue(peer * td.num_channels + c.channel) - previous;
+                c.pos = 0; c.end = count; c.field = 0; c.loaded = true;
+                if (weighted) {
+                    const uint32_t total = channel_gm.GetValue(peer * td.num_channels + td.num_channels - 1);
+                    const uint32_t first = PeerRowBoundary(total, lane, td.udma_workers_per_peer,
+                        td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
+                    const uint32_t last = PeerRowBoundary(total, lane + 1, td.udma_workers_per_peer,
+                        td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
+                    const uint32_t skip = first > previous ? first - previous : 0;
+                    const uint32_t stop = last > previous ? last - previous : 0;
+                    c.pos = skip < count ? skip : count; c.end = stop < count ? stop : count;
+                }
+                c.row = (td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0) + previous + c.pos;
+            }
+            if (c.channel >= td.num_channels) continue;
+            active = true;
+            sender.BeginVisit(p);
+            uint32_t visit = td.udma_wqes_per_visit;
+            while (visit && c.pos < c.end) {
+                const uint64_t index = (uint64_t(peer) * td.num_channels + c.channel) * plan_stride + c.pos;
+                const uint32_t available = (c.end - c.pos) * fields - c.field;
+                const uint32_t n = sender.PutRows(p, plan + index, c.row, c.field,
+                    available < visit ? available : visit, available);
+                const uint32_t rows = (c.field + n) / fields;
+                c.field = (c.field + n) % fields; c.pos += rows; c.row += rows; visit -= n;
+            }
+        }
+    }
+}
+
 template <uint32_t Capacity, uint32_t Qps, class Resource>
 __aicore__ inline void DispatchRemoteImpl(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR plan, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
@@ -36,6 +88,12 @@ __aicore__ inline void DispatchRemoteImpl(
     const uint32_t fields = td.has_x_scales && scale_bytes ? 2U : 1U;
     const uint32_t lane = core % td.udma_workers_per_peer;
     const bool weighted = td.udma_cross_lane0_weight != 1;
+    if (td.dispatch_experiment_flags & kDispatchPeerCursor) {
+        profile.Add(profile.plan_ns, stage); stage = profile.Now();
+        DispatchPeerCursors<Capacity>(sender, td, core, reinterpret_cast<const __gm__ int32_t*>(plan),
+            rank_gm, channel_gm, plan_stride, fields);
+        profile.Add(profile.send_ns, stage); stage = profile.Now();
+    } else {
     // Default retains channel ownership. Weighted lanes intersect one whole-peer
     // row partition with each channel, so rounding never resets at a tile boundary.
     for (uint32_t ch = weighted ? 0U : lane; sender.Count() && ch < td.num_channels;
@@ -116,12 +174,20 @@ __aicore__ inline void DispatchRemoteImpl(
             stage = profile.Now();
         }
     }
+    }
     profile.Add(profile.plan_ns, stage);
     stage = profile.Now();
     sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
     profile.Add(profile.publish_ns, stage);
     stage = profile.Now();
-    WaitIncoming<true>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, cores, td.udma_workers_per_peer * Qps);
+    IncomingObservation observation{profile.origin_cycle};
+    if (profile.trace) {
+        observation.first = profile.first_poll; observation.ready = profile.ready_poll;
+        observation.polls = profile.poll_count;
+    }
+    WaitIncoming<true>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, cores,
+        td.udma_workers_per_peer * Qps, profile.enabled ? &observation : nullptr);
+    profile.remote_wait_ns = observation.remote_ns; profile.local_sync_ns = observation.local_ns;
     profile.Add(profile.incoming_ns, stage);
     stage = profile.Now();
     sender.Quiet();
@@ -134,7 +200,9 @@ __aicore__ inline void DispatchRemoteImpl(
     profile.Add(profile.barrier_ns, stage);
     // All sender/metadata readers have drained; the initial WQE area can now
     // stage this AIV's private diagnostic record before output-copy reuse.
+    profile.send_records = sender.Count() * Qps;
     profile.Store(td.udma_profile_output, core, resource.template GetBufferByByte<uint64_t>(0));
+    sender.StoreTrace(td.udma_profile_output, core, resource.template GetBufferByByte<uint64_t>(0));
 }
 template <class Resource>
 __aicore__ inline void DispatchRemote(

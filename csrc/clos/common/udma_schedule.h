@@ -22,6 +22,17 @@ inline constexpr uint32_t kGroupStaggeredOrder = 2;
 inline constexpr uint32_t kGroupRoundRobinOrder = 3;
 inline constexpr uint32_t kGroupPeerCapacity = 64;
 
+// Ordinary GM diagnostic rows; all record strides are 32-byte aligned.
+inline constexpr uint32_t kTraceSendWords = 12;
+inline constexpr uint32_t kTraceReceiveWords = 8;
+inline constexpr uint32_t kTraceMaxIncoming = 128;
+ASCEND_DEEPEP_SCHEDULE_FN uint32_t DispatchTraceStride(
+    uint32_t world, uint32_t cores, uint32_t markers, uint32_t qps)
+{
+    return 32U + world * qps * kTraceSendWords +
+        ((world * markers + cores - 1U) / cores) * kTraceReceiveWords;
+}
+
 ASCEND_DEEPEP_SCHEDULE_FN bool ValidPeers(uint32_t peers)
 {
     return peers == 1 || peers == 2 || peers == 4 || peers == 8;

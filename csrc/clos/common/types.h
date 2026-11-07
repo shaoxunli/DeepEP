@@ -35,6 +35,8 @@ using topk_idx_t = int_with_bits<EP_NUM_TOPK_IDX_BITS>::type;
 
 inline constexpr uint32_t kDispatchWqeCache = 1U;
 inline constexpr uint32_t kDispatchProfile = 2U;
+inline constexpr uint32_t kDispatchPeerCursor = 4U;
+inline constexpr uint32_t kDispatchTrace = 8U;
 inline constexpr uint32_t kDispatchProfileWords = 32U; // 256-byte private row per AIV.
 
 struct alignas(8) DispatchLayoutTilingData {

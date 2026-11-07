@@ -401,7 +401,15 @@ def test_dispatch_wqe_cache_matches_direct_sender(tmp_path):
     text = (ROOT / "csrc/clos/kernels/dispatch/udma_dispatch_sender.h").read_text()
     builders = cpp_functions(text, "BuildDispatchWqes", "GatherDispatchCachedWqes")
     methods = cpp_functions(
-        text.replace("Now() const", "Now()"), "PutRows", "Flush", "BeginVisit", "Credit", "Now", "PutCachedRows"
+        text.replace("Now() const", "Now()").replace("Tracing() const", "Tracing()"),
+        "PutRows",
+        "Flush",
+        "BeginVisit",
+        "Credit",
+        "Now",
+        "PutCachedRows",
+        "TraceRows",
+        "Tracing",
     )
     methods = methods.replace("private:", "public:")
     source = tmp_path / "cache.cpp"
@@ -436,8 +444,8 @@ constexpr unsigned kRequestsOffset=2048,kHeadersOffset=3072,EVENT_ID5=5;
 struct TD { unsigned hidden=7,x_element_bytes=2,num_scales=3,scale_element_bytes=4,
     num_tokens=128,has_x_scales=0; };
 struct DispatchProfile {
-    bool enabled=true; uint64_t build_ns=0,submit_ns=0,credit_ns=0,wqes=0,batches=0,refills=0,hits=0;
-    uint64_t Now() {return 0;} void Add(uint64_t&,uint64_t) {}
+    bool enabled=true,trace=true; uint64_t credit_checks=0,credit_stalls=0; uint64_t build_ns=0,submit_ns=0,credit_ns=0,wqes=0,batches=0,refills=0,hits=0;
+    uint64_t Now() {return 0;} uint64_t Elapsed() {return 0;} void Add(uint64_t&,uint64_t) {}
 };
 using Wqe=std::array<uint64_t,8>;
 template<unsigned Capacity,unsigned Qps> struct SenderT {
@@ -447,9 +455,10 @@ template<unsigned Capacity,unsigned Qps> struct SenderT {
     std::vector<Wqe> sent;
     unsigned QueuePeer(unsigned p) {return qp_*Capacity+p;}
     void SelectQp(unsigned q) {qp_=q;}
-    void EnsurePayloadCredit(unsigned) {
+    bool EnsurePayloadCredit(unsigned) {
         // Exercise the scratch overwrite performed by an SQ checkpoint.
         if (++credits%3==0) std::memset(scratch_,0xEE,2048);
+        return credits%3==0;
     }
     void SubmitPayload(unsigned n) {
         for(unsigned i=0;i<n;++i) {
@@ -463,7 +472,7 @@ template<unsigned Capacity,unsigned Qps> struct SenderT {
         + r"""
 template<unsigned Capacity,unsigned Qps> struct TestSender:SenderT<Capacity,Qps> {
     using Base=SenderT<Capacity,Qps>;
-    using Base::scratch_;using Base::peers_;using Base::active_state_;using Base::last_;
+    using Base::scratch_;using Base::peers_;using Base::active_state_;using Base::last_;using Base::count_;
     static constexpr unsigned kDispatchBasesOffset=kHeadersOffset+Capacity*Qps*128;
     static constexpr unsigned kDispatchEpochOffset=kDispatchBasesOffset+Capacity*Qps*64;
     static constexpr unsigned kCacheOffset=kDispatchEpochOffset+32;
@@ -471,6 +480,7 @@ template<unsigned Capacity,unsigned Qps> struct TestSender:SenderT<Capacity,Qps>
     TD td_; uint64_t x_=0x10000000,scales_=0x20000000;
     DispatchProfile stats;DispatchProfile* profile_=&stats;
     bool cache_enabled_; CacheEntry cache_[8]{};
+    uint64_t trace_[Capacity*Qps][12]{}; unsigned trace_pending_[(Capacity*Qps+31)/32]{};
     unsigned rows_pending_=0,spans_=0,cache_readers_=0,next_qp_[Capacity]{};
     alignas(32) uint8_t arena[65536]{};
     TestSender(bool cache,bool scales):cache_enabled_(cache) {
@@ -528,6 +538,9 @@ template<unsigned Qps> void check(bool cache,bool scales,unsigned visit,unsigned
         s.Flush();
     }
     assert(s.sent==expected && s.stats.wqes==expected.size());
+    uint64_t traced=0,pressures=0;
+    for(auto& t:s.trace_) {traced+=t[6];pressures+=t[8];}
+    assert(traced==expected.size() && pressures==s.stats.credit_stalls && s.stats.credit_checks==s.credits);
     if(cache) assert(s.stats.refills>0);
     if(cache && peers==8 && Qps==1 && visit<32) assert(s.stats.hits>0);
 }
@@ -668,3 +681,96 @@ def test_tuning_visits_share_launcher_evidence(tmp_path):
         except ValueError: pass
         else: raise AssertionError('failed launcher accepted')
     """)
+
+
+def test_dispatch_peer_cursors_preserve_row_ownership(tmp_path):
+    """Actual cursor scheduler versus independent per-row ownership, with partial sends."""
+    import shutil
+    from tests.utils.cpp import cpp_functions
+
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    header = (ROOT / "csrc/clos/kernels/dispatch/udma_dispatch_schedule.h").read_text()
+    method = cpp_functions(header, "DispatchPeerCursors")
+    source = tmp_path / "cursor.cpp"
+    source.write_text(
+        r"""
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <vector>
+#include "common/udma_schedule.h"
+#define __aicore__
+#define __gm__
+using ascend_deepep::udma::PeerRowBoundary;
+struct DispatchTilingData {
+    uint32_t rank=1,world_size=16,num_channels=0,udma_workers_per_peer=0,
+        udma_cross_lane0_weight=0,udma_ranks_per_group=8,udma_wqes_per_visit=0;
+};
+struct Prefix { std::vector<int32_t> v; int32_t GetValue(unsigned i) {return v.at(i);} };
+using Item=std::array<unsigned,4>;
+struct Sender {
+    unsigned fields,visit,left=0,calls=0,active=0;
+    std::vector<Item> sent;
+    unsigned Count() {return 4;} unsigned Rank(unsigned p) {return p*3;}
+    void BeginVisit(unsigned p) {active=p;left=visit;}
+    unsigned PutRows(unsigned p,const int32_t* indices,unsigned row,unsigned field,unsigned n,unsigned available) {
+        assert(p==active && n && n<=left && n<=available);
+        n=std::min(n,1+(calls++%7)); // Partial batch and split scale fields.
+        for(unsigned i=0;i<n;++i) sent.push_back({Rank(p),unsigned(indices[(field+i)/fields]),row+(field+i)/fields,(field+i)%fields});
+        left-=n;return n;
+    }
+};
+"""
+        + method
+        + r"""
+int main() {
+ for(unsigned tokens:{0,1,257,1025}) for(unsigned channels:{1,3,8})
+ for(unsigned workers:{1,2}) for(unsigned weight:{1,3}) for(unsigned fields:{1,2})
+ for(unsigned visit:{4,8,16,32}) {
+    DispatchTilingData td;td.num_channels=channels;td.udma_workers_per_peer=workers;
+    td.udma_cross_lane0_weight=weight;td.udma_wqes_per_visit=visit;
+    unsigned width=(tokens+channels-1)/channels,stride=(width+7)/8*8;
+    std::vector<int32_t> plan(16*channels*stride,-999);
+    Prefix rp,cp;rp.v.resize(256);cp.v.resize(16*channels);
+    for(unsigned peer=0;peer<16;++peer) rp.v[peer]=100+peer*10000;
+    std::vector<std::vector<Item>> expected(workers);
+    for(unsigned p=0;p<4;++p) {
+        unsigned peer=p*3,total=0;std::vector<Item> all;std::vector<unsigned> chs;
+        for(unsigned ch=0;ch<channels;++ch) {
+            unsigned pos=0;
+            for(unsigned t=ch*width;t<std::min(tokens,(ch+1)*width);++t) {
+                if(p==1 || (t+peer)% (p+2)) continue; // Empty and skew peers.
+                plan[(peer*channels+ch)*stride+pos++]=t;
+                all.push_back({peer,t,rp.v[peer]+total++,0});chs.push_back(ch);
+            }
+            cp.v[peer*channels+ch]=total;
+        }
+        for(unsigned index=0;index<all.size();++index) {
+            // Independent ownership definition; no call to PeerRowBoundary.
+            unsigned owner=chs[index]%workers;
+            if(weight!=1) {
+                unsigned first_lane_weight=peer/8==td.rank/8?1:weight;
+                unsigned split=uint64_t(total)*first_lane_weight/(first_lane_weight+workers-1);
+                owner=workers==1 || index<split?0:1;
+            }
+            for(unsigned f=0;f<fields;++f) {auto item=all[index];item[3]=f;expected[owner].push_back(item);}
+        }
+    }
+    for(unsigned lane=0;lane<workers;++lane) {
+        Sender sender{fields,visit};
+        DispatchPeerCursors<8>(sender,td,lane,plan.data(),rp,cp,stride,fields);
+        std::sort(sender.sent.begin(),sender.sent.end());std::sort(expected[lane].begin(),expected[lane].end());
+        assert(sender.sent==expected[lane]);
+    }
+ }
+}
+"""
+    )
+    binary = tmp_path / "cursor"
+    subprocess.run(
+        [compiler, "-std=c++17", "-O2", "-I", str(ROOT / "csrc/clos"), str(source), "-o", str(binary)], check=True
+    )
+    subprocess.run([str(binary)], check=True)

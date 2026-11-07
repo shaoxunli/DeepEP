@@ -120,11 +120,16 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     // Clears incoming payload markers and publishes this invocation's output
     // addresses/top-k initialization before remote writes. Every AIV participates.
     ascend_deepep::udma::DispatchProfile profile{(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchProfile) != 0};
+    profile.trace = (tiling.dispatch_experiment_flags & ascend_deepep::kDispatchTrace) != 0;
+    profile.rank = tiling.rank; profile.world = tiling.world_size; profile.cores = core_num;
+    profile.markers = tiling.udma_workers_per_peer * tiling.udma_qps_per_worker;
+    profile.qps = tiling.udma_qps_per_worker;
     uint64_t profile_start = profile.Now();
     ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
         core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
         tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
     profile.Add(profile.begin_ns, profile_start);
+    profile.origin_cycle = profile.Now();
     profile_start = profile.Now();
 
     // With spare cores, payload owners skip this helper and immediately start

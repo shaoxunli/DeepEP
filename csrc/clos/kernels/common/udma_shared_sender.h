@@ -212,18 +212,20 @@ public:
     }
 
 protected:
-    __aicore__ void EnsurePayloadCredit(uint32_t p)
+    __aicore__ bool EnsurePayloadCredit(uint32_t p)
     {
         auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(peers_[p].state);
         // Admit a whole batch plus one SO before overwriting any SQ slot.
         // A checkpoint may overwrite scratch only before a new batch is built.
-        if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes + 1U)) {
+        const bool pressure = !aclshmemi_udma_sq_has_credit(state, kBatchWqes + 1U);
+        if (pressure) {
             aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kDone>(
                 checkpoint_ + kQpCount + qp_, checkpoint_, reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
                 1U, peers_[p].peer, qp_, EVENT_ID5);
             aclshmemx_udma_qp_quiet(peers_[p].peer, qp_);
             if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes + 1U)) trap();
         }
+        return pressure;
     }
 
     __aicore__ void SubmitPayload(uint32_t count)
@@ -267,10 +269,18 @@ using Sender = SenderT<>;
 inline constexpr uint64_t kIncomingCyclesPerUs = 1000ULL;
 inline constexpr uint64_t kIncomingTimeoutCycles = 10ULL * 1000 * 1000 * kIncomingCyclesPerUs;
 
+// Optional caller-owned diagnostics. Times share one device's counter only.
+struct IncomingObservation {
+    uint64_t origin, remote_ns = 0, local_ns = 0;
+    uint64_t* first = nullptr;
+    uint64_t* ready = nullptr;
+    uint64_t* polls = nullptr;
+};
+
 template <bool IsDispatch>
 __aicore__ inline void WaitIncoming(
     GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t world, uint32_t core, uint32_t cores,
-    uint32_t marker_count = 1)
+    uint32_t marker_count = 1, IncomingObservation* observation = nullptr)
 {
     // One deadline for this core's entire incoming-marker phase, not 10 s per
     // source. Poll the same cache-invalidated EQ marker as SHMEM's unbounded wait.
@@ -283,11 +293,21 @@ __aicore__ inline void WaitIncoming(
         auto* address = Signal(base, offset, source) + worker;
         AscendC::GlobalTensor<uint64_t> signal;
         signal.SetGlobalBuffer(address);
+        const uint32_t slot = item / cores;
+        const bool record = observation && observation->first;
+        if (record) {
+            observation->first[slot] = static_cast<uint64_t>(AscendC::GetSystemCycle()) - observation->origin;
+            observation->polls[slot] = 0;
+        }
         while (true) {
             dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(address));
             const uint64_t value = signal.GetValue(0);
-            if (value == 1U)
+            if (record) ++observation->polls[slot];
+            if (value == 1U) {
+                if (record) observation->ready[slot] =
+                    static_cast<uint64_t>(AscendC::GetSystemCycle()) - observation->origin;
                 break;
+            }
             const uint64_t elapsed = static_cast<uint64_t>(AscendC::GetSystemCycle()) - start;
             if (elapsed >= kIncomingTimeoutCycles) {
                 if constexpr (IsDispatch) {
@@ -311,7 +331,12 @@ __aicore__ inline void WaitIncoming(
             }
         }
     }
+    const uint64_t remote_end = observation ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0;
     AscendC::SyncAll<true>();
+    if (observation) {
+        observation->remote_ns = remote_end - start;
+        observation->local_ns = static_cast<uint64_t>(AscendC::GetSystemCycle()) - remote_end;
+    }
 }
 #endif
 } // namespace ascend_deepep::udma

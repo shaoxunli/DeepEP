@@ -575,7 +575,11 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
     tiling.dispatch_experiment_flags =
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_WQE_CACHE") ? ascend_deepep::kDispatchWqeCache : 0U) |
-        (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PROFILE") ? ascend_deepep::kDispatchProfile : 0U);
+        (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PROFILE") ? ascend_deepep::kDispatchProfile : 0U) |
+        (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PEER_CURSOR") ? ascend_deepep::kDispatchPeerCursor : 0U) |
+        (DispatchExperiment("DEEPEP_CLOS_DISPATCH_TRACE")
+             ? ascend_deepep::kDispatchTrace | ascend_deepep::kDispatchProfile
+             : 0U);
     TORCH_CHECK(!tiling.dispatch_experiment_flags || (use_udma && !tiling.udma_token_schedule),
                 "Clos dispatch experiments require the UDMA peer schedule");
     TORCH_CHECK(!(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchProfile) || !capturing,
@@ -676,9 +680,17 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // unspecified; consumers select valid rows by rank/channel prefixes.
     auto recv_src_idx = allocator.Empty({cached_mode ? 0 : num_recv_tokens}, int_options);
     torch::Tensor profile_output;
+    const uint32_t markers = tiling.udma_workers_per_peer * tiling.udma_qps_per_worker;
+    const bool trace_dispatch = tiling.dispatch_experiment_flags & ascend_deepep::kDispatchTrace;
+    TORCH_CHECK(!trace_dispatch || (world_size * markers + resolved_num_aiv - 1) / resolved_num_aiv <=
+                                       ascend_deepep::udma::kTraceMaxIncoming,
+                "Too many incoming markers for dispatch tracing");
+    const uint32_t profile_stride = trace_dispatch
+                                        ? ascend_deepep::udma::DispatchTraceStride(world_size, resolved_num_aiv,
+                                                                                   markers, tiling.udma_qps_per_worker)
+                                        : ascend_deepep::kDispatchProfileWords;
     if (tiling.dispatch_experiment_flags & ascend_deepep::kDispatchProfile) {
-        profile_output =
-            allocator.Empty({resolved_num_aiv, ascend_deepep::kDispatchProfileWords}, x.options().dtype(torch::kInt64));
+        profile_output = allocator.Empty({resolved_num_aiv, profile_stride}, x.options().dtype(torch::kInt64));
         tiling.udma_profile_output = reinterpret_cast<uint64_t>(profile_output.data_ptr());
     }
     LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
@@ -691,19 +703,50 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         auto cpu_profile = profile_output.cpu();
         const auto* values = cpu_profile.data_ptr<int64_t>();
         constexpr const char* names[] = {
-            "begin_ns",   "metadata_ns", "setup_ns", "plan_ns",    "send_ns", "build_ns", "credit_ns", "submit_ns",
-            "publish_ns", "incoming_ns", "quiet_ns", "barrier_ns", "refills", "hits",     "wqes",      "batches"};
+            "begin_ns",      "metadata_ns",   "setup_ns",      "plan_ns",     "send_ns",      "build_ns",
+            "credit_ns",     "submit_ns",     "publish_ns",    "incoming_ns", "quiet_ns",     "barrier_ns",
+            "refills",       "hits",          "wqes",          "batches",     "origin_cycle", "remote_wait_ns",
+            "local_sync_ns", "credit_checks", "credit_stalls", "send_records"};
         for (int64_t core = 0; core < resolved_num_aiv; ++core) {
             std::ostringstream line;
             line << "[CLOS_DISPATCH_PROFILE] rank=" << rank << " core=" << core << " cached=" << cached_mode
-                 << " wqe_cache=" << bool(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchWqeCache);
+                 << " wqe_cache=" << bool(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchWqeCache)
+                 << " peer_cursor=" << bool(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchPeerCursor);
             for (uint32_t word = 0; word < sizeof(names) / sizeof(names[0]); ++word)
-                line << ' ' << names[word] << '=' << values[core * ascend_deepep::kDispatchProfileWords + word];
+                line << ' ' << names[word] << '=' << values[core * profile_stride + word];
             // One short write keeps records from different torchrun processes
             // intact; unbuffered stdio may split one formatted line internally.
             const auto message = line.str() + '\n';
             TORCH_CHECK(::write(STDERR_FILENO, message.data(), message.size()) == static_cast<ssize_t>(message.size()),
                         "Failed to write Clos dispatch profiling record");
+            if (!trace_dispatch) continue;
+            const auto* row = values + core * profile_stride;
+            auto emit = [&](const char* kind, const int64_t* record, const char* const* labels, uint32_t count) {
+                std::ostringstream trace;
+                trace << "[CLOS_DISPATCH_" << kind << "] rank=" << rank << " core=" << core
+                      << " cached=" << cached_mode;
+                for (uint32_t i = 0; i < count; ++i) trace << ' ' << labels[i] << '=' << record[i];
+                const auto text = trace.str() + '\n';
+                TORCH_CHECK(::write(STDERR_FILENO, text.data(), text.size()) == static_cast<ssize_t>(text.size()),
+                            "Failed to write Clos dispatch trace record");
+            };
+            constexpr const char* send_names[] = {
+                "peer", "qp",      "first_post_ns",  "last_post_ns", "marker_post_ns", "quiet_observed_ns",
+                "wqes", "batches", "pressure_count", "pressure_ns",  "quiet_ns",       "sq_alias"};
+            TORCH_CHECK(row[21] >= 0 && row[21] <= world_size * tiling.udma_qps_per_worker,
+                        "Invalid dispatch trace sender count");
+            for (int64_t item = 0; item < row[21]; ++item)
+                emit("SEND", row + ascend_deepep::kDispatchProfileWords + item * ascend_deepep::udma::kTraceSendWords,
+                     send_names, 12);
+            constexpr const char* receive_names[] = {"source", "marker", "first_poll_ns", "ready_observed_ns", "polls"};
+            for (int64_t item = core; item < world_size * markers; item += resolved_num_aiv) {
+                if (item / markers == rank) continue;
+                emit("RECEIVE",
+                     row + ascend_deepep::kDispatchProfileWords +
+                         world_size * tiling.udma_qps_per_worker * ascend_deepep::udma::kTraceSendWords +
+                         (item / resolved_num_aiv) * ascend_deepep::udma::kTraceReceiveWords,
+                     receive_names, 5);
+            }
         }
     }
     return {recv_x,

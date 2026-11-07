@@ -113,3 +113,52 @@ cached dispatch with BF16 and FP8, masked and uneven routes, empty peers, and
 dispatch/combine reuse. For performance, first compare equal cross-server
 payloads with equal sender cores, huge pages, and L2 settings, then repeat full
 fresh/cached dispatch to detect costs shifted between stages.
+
+## Independent peer cursors
+
+`DEEPEP_CLOS_DISPATCH_PEER_CURSOR=1` opts into independent per-peer cursors.
+Default is `0`. Each visit still issues at most the configured WQE count and
+uses the existing sender/QP assignment and unsignaled batch protocol. A peer
+advances through its immutable channel lists without waiting for the other
+peers to finish the same input-token tile. Unweighted channel ownership and
+weighted whole-peer row intersections are unchanged. No extra payload is sent.
+
+With this mode, `send_ns` includes cursor advancement and channel-prefix reads;
+compare the full kernel or `plan_ns + send_ns`, rather than treating a reduced
+`plan_ns` alone as a speedup. Cache and cursor switches are independent; start
+cursor comparisons with the WQE cache disabled.
+
+## Completion observations
+
+`DEEPEP_CLOS_DISPATCH_TRACE=1` implies `PROFILE=1` and adds per-peer/QP and
+per-incoming-marker records. It is off by default and rejects graph capture.
+The ordinary GM stride in u64 words per AIV is
+`32 + world*qps*12 + ceil(world*workers*qps/cores)*8`; each record is 32-byte
+aligned. At most 128 incoming slots per AIV are supported. Allocation/readback
+lifetime follows the execution stream, with no added SHMEM region. Only
+initialized owned records are read, including skips for self markers.
+
+The summary adds `remote_wait_ns` and `local_sync_ns`, splitting the existing
+`incoming_ns` interval; `credit_checks` and `credit_stalls` count SQ admission
+checks and actual pressure checkpoints. They do not add new waits or CQEs.
+`origin_cycle` is the per-AIV system counter immediately after Begin.
+
+`CLOS_DISPATCH_SEND` records peer, physical QP, first/last payload posting,
+SO posting, Quiet return, WQE/batch counts, pressure count/time, and an SQ
+alias index local to that AIV. A batch that contains several peers contributes
+one batch observation to each peer; do not sum these as global doorbell counts.
+Peers sharing an SQ inherit the same Quiet observation, not separate CQEs.
+`CLOS_DISPATCH_RECEIVE` records the first poll and ready observation for each
+source/worker marker, plus poll count. Offsets are relative to the AIV origin.
+
+These are software observations. Quiet follows incoming waits and therefore
+bounds completion from above; it does not timestamp NIC completion. A marker
+ready on its first poll arrived at or before the observation. Sequential
+polling can delay observation of later sources. Compare clocks only within one
+device; never subtract sender and receiver clocks on different ranks. Trace
+collection perturbs scheduling and must not provide headline bandwidth.
+
+The cursor CPU regression executes the actual scheduler against independently
+calculated output-row ownership, covering empty and skew peers/channels,
+partial sends, payload/scales, weighted/unweighted lanes and varied visits.
+NPU precision and performance evidence must still be collected separately.
