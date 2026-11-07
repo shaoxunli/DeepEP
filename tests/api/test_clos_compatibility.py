@@ -390,6 +390,159 @@ int main() {
     subprocess.run([str(binary)], check=True, timeout=30)
 
 
+def test_dispatch_wqe_cache_matches_direct_sender(tmp_path):
+    """Run the actual SIMT builders and sender methods with a synchronous UB/SQ double."""
+    import shutil
+    from tests.utils.cpp import cpp_functions
+
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    text = (ROOT / "csrc/clos/kernels/dispatch/udma_dispatch_sender.h").read_text()
+    builders = cpp_functions(text, "BuildDispatchWqes", "GatherDispatchCachedWqes")
+    methods = cpp_functions(
+        text.replace("Now() const", "Now()"), "PutRows", "Flush", "BeginVisit", "Credit", "Now", "PutCachedRows"
+    )
+    methods = methods.replace("private:", "public:")
+    source = tmp_path / "cache.cpp"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
+#include <array>
+#include <algorithm>
+#define __aicore__
+#define __simt_vf__
+#define __launch_bounds__(n)
+#define __gm__
+#define __ubuf__
+struct { unsigned x; } threadIdx;
+struct dim3 { explicit dim3(unsigned) {} };
+namespace __asc_simt_vf { void __trap() { throw std::runtime_error("bad WQE"); } }
+void trap() { __asc_simt_vf::__trap(); }
+namespace AscendC {
+enum class HardEvent {S_V,V_MTE3,V_S};
+template<HardEvent> void SetFlag(unsigned) {}
+template<HardEvent> void WaitFlag(unsigned) {}
+}
+template<auto F, class... A> void asc_vf_call(dim3, A... a) {
+    for (unsigned i=0;i<32;++i) {threadIdx.x=i;F(a...);}
+}
+constexpr unsigned kBatchWqes=32,kWqeBytes=64,kDispatchCacheEntries=8,kOutputRecordWords=8;
+constexpr unsigned kRequestsOffset=2048,kHeadersOffset=3072,EVENT_ID5=5;
+struct TD { unsigned hidden=7,x_element_bytes=2,num_scales=3,scale_element_bytes=4,
+    num_tokens=128,has_x_scales=0; };
+struct DispatchProfile {
+    bool enabled=true; uint64_t build_ns=0,submit_ns=0,credit_ns=0,wqes=0,batches=0,refills=0,hits=0;
+    uint64_t Now() {return 0;} void Add(uint64_t&,uint64_t) {}
+};
+using Wqe=std::array<uint64_t,8>;
+template<unsigned Capacity,unsigned Qps> struct SenderT {
+    struct Peer { uint64_t state; }; Peer peers_[Capacity*Qps];
+    uint8_t* scratch_; unsigned count_=Capacity,qp_=0,last_=0,credits=0;
+    uint64_t active_state_=0;
+    std::vector<Wqe> sent;
+    unsigned QueuePeer(unsigned p) {return qp_*Capacity+p;}
+    void SelectQp(unsigned q) {qp_=q;}
+    void EnsurePayloadCredit(unsigned) {
+        // Exercise the scratch overwrite performed by an SQ checkpoint.
+        if (++credits%3==0) std::memset(scratch_,0xEE,2048);
+    }
+    void SubmitPayload(unsigned n) {
+        for(unsigned i=0;i<n;++i) {
+            Wqe w;std::memcpy(w.data(),scratch_+i*64,64);sent.push_back(w);
+        }
+        std::memset(scratch_,0xDD,2048); // No cache reader may depend on this region.
+    }
+};
+"""
+        + builders
+        + r"""
+template<unsigned Capacity,unsigned Qps> struct TestSender:SenderT<Capacity,Qps> {
+    using Base=SenderT<Capacity,Qps>;
+    using Base::scratch_;using Base::peers_;using Base::active_state_;using Base::last_;
+    static constexpr unsigned kDispatchBasesOffset=kHeadersOffset+Capacity*Qps*128;
+    static constexpr unsigned kDispatchEpochOffset=kDispatchBasesOffset+Capacity*Qps*64;
+    static constexpr unsigned kCacheOffset=kDispatchEpochOffset+32;
+    struct CacheEntry {uint64_t next_indices=0;unsigned peer=UINT32_MAX,next_row=0,next_field=0,cursor=0,count=0;};
+    TD td_; uint64_t x_=0x10000000,scales_=0x20000000;
+    DispatchProfile stats;DispatchProfile* profile_=&stats;
+    bool cache_enabled_; CacheEntry cache_[8]{};
+    unsigned rows_pending_=0,spans_=0,cache_readers_=0,next_qp_[Capacity]{};
+    alignas(32) uint8_t arena[65536]{};
+    TestSender(bool cache,bool scales):cache_enabled_(cache) {
+        scratch_=arena;td_.has_x_scales=scales;
+        for(unsigned p=0;p<Capacity*Qps;++p) {
+            peers_[p].state=1+(p/Capacity)*3+(p%3); // Shared and distinct SQs.
+            for(unsigned last=0;last<2;++last) {
+                auto* h=reinterpret_cast<uint64_t*>(arena+kHeadersOffset+(p*2+last)*64);
+                for(unsigned w=0;w<5;++w) h[w]=p*100+w;
+            }
+            auto* b=reinterpret_cast<uint64_t*>(arena+kDispatchBasesOffset+p*64);
+            b[0]=0x30000000+p*65536;b[1]=0x40000000+p*65536;b[2]=10000;
+        }
+    }
+"""
+        + methods
+        + r"""
+};
+template<unsigned Qps> void check(bool cache,bool scales,unsigned visit,unsigned peers) {
+    TestSender<16,Qps> s(cache,scales);
+    const unsigned fields=scales?2:1;
+    std::vector<Wqe> expected;
+    for(unsigned epoch=0;epoch<3;++epoch) {
+        int32_t tokens[16][47];unsigned cursor[16]{},field[16]{},total[16];
+        for(unsigned p=0;p<16;++p) {
+            total[p]=p==3?0:17+p*2;
+            for(unsigned j=0;j<47;++j) tokens[p][j]=(j*7+p+epoch)%128;
+        }
+        bool remaining=true;
+        while(remaining) {
+            remaining=false;
+            for(unsigned p=0;p<peers;++p) {
+                unsigned left=visit;
+                if(cursor[p]<total[p]) s.BeginVisit(p);
+                while(left && cursor[p]<total[p]) {
+                    auto available=(total[p]-cursor[p])*fields-field[p];
+                    auto request=std::min(left,available);
+                    unsigned row=epoch*100+cursor[p],q=s.QueuePeer(p);
+                    auto n=s.PutRows(p,tokens[p]+cursor[p],row,field[p],request,available);
+                    assert(n && n<=request);
+                    for(unsigned j=0;j<n;++j) {
+                        unsigned pos=field[p]+j,token=tokens[p][cursor[p]+pos/fields];
+                        bool scale=pos%fields!=0;
+                        uint64_t bytes=scale?12:14;
+                        Wqe w{};for(unsigned k=0;k<5;++k)w[k]=q*100+k;
+                        w[5]=(scale?0x40000000ULL:0x30000000ULL)+q*65536+(row+pos/fields)*bytes;
+                        w[6]=bytes;w[7]=(scale?0x20000000ULL:0x10000000ULL)+token*bytes;
+                        expected.push_back(w);
+                    }
+                    cursor[p]+=(field[p]+n)/fields;field[p]=(field[p]+n)%fields;left-=n;
+                }
+                remaining|=cursor[p]<total[p];
+            }
+        }
+        s.Flush();
+    }
+    assert(s.sent==expected && s.stats.wqes==expected.size());
+    if(cache) assert(s.stats.refills>0);
+    if(cache && peers==8 && Qps==1 && visit<32) assert(s.stats.hits>0);
+}
+int main() {
+    for(bool cache:{false,true})for(bool scales:{false,true})for(unsigned v:{4,8,16,32})for(unsigned peers:{8,16}) {
+        check<1>(cache,scales,v,peers);check<2>(cache,scales,v,peers);
+    }
+}
+"""
+    )
+    binary = tmp_path / "cache"
+    subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
 def test_unsignaled_payload_wrap_and_pressure_checkpoint(tmp_path):
     """Execute the sender methods against bounded queues, including shared SQs."""
     import shutil

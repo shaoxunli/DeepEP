@@ -13,13 +13,17 @@ static_assert(kListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 
 template <uint32_t Capacity, uint32_t Qps, class Resource>
 __aicore__ inline void DispatchRemoteImpl(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR plan, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
-    GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores)
+    GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores, DispatchProfile& profile)
 {
     constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + kOutputRecordBytes) + 32;
-    static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= 216 * 1024);
+    static_assert(sender_bytes + kDispatchCacheBytes + Capacity * kTileTokens * sizeof(int32_t) <= 216 * 1024);
+    const uint32_t cache_bytes = td.dispatch_experiment_flags & kDispatchWqeCache ? kDispatchCacheBytes : 0U;
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
-    auto lists = resource.template GetBufferByByte<int32_t>(sender_bytes);
-    DispatchSenderT<Capacity, Qps> sender(td, core, wq, workspace, x, scales);
+    auto lists = resource.template GetBufferByByte<int32_t>(sender_bytes + cache_bytes);
+    uint64_t stage = profile.Now();
+    DispatchSenderT<Capacity, Qps> sender(td, core, wq, workspace, x, scales, UINT32_MAX, 0, &profile);
+    profile.Add(profile.setup_ns, stage);
+    stage = profile.Now();
     AscendC::GlobalTensor<int32_t> plan_gm;
     plan_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(plan));
     AscendC::GlobalTensor<int32_t> rank_gm, channel_gm;
@@ -86,6 +90,8 @@ __aicore__ inline void DispatchRemoteImpl(
                 remaining += counts[p];
                 consumed[p] += counts[p];
             }
+            profile.Add(profile.plan_ns, stage);
+            stage = profile.Now();
             while (remaining) {
                 for (uint32_t p = 0; p < sender.Count(); ++p) {
                     uint32_t visit = td.udma_wqes_per_visit;
@@ -96,7 +102,7 @@ __aicore__ inline void DispatchRemoteImpl(
                         const uint32_t available = (counts[p] - cursor[p]) * fields - field[p];
                         const uint32_t count = sender.PutRows(
                             p, reinterpret_cast<const __gm__ int32_t*>(plan) + index, row[p], field[p],
-                            available < visit ? available : visit);
+                            available < visit ? available : visit, available);
                         const uint32_t rows = (field[p] + count) / fields;
                         field[p] = (field[p] + count) % fields;
                         cursor[p] += rows;
@@ -106,30 +112,44 @@ __aicore__ inline void DispatchRemoteImpl(
                     }
                 }
             }
+            profile.Add(profile.send_ns, stage);
+            stage = profile.Now();
         }
     }
+    profile.Add(profile.plan_ns, stage);
+    stage = profile.Now();
     sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
+    profile.Add(profile.publish_ns, stage);
+    stage = profile.Now();
     WaitIncoming<true>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, cores, td.udma_workers_per_peer * Qps);
+    profile.Add(profile.incoming_ns, stage);
+    stage = profile.Now();
     sender.Quiet();
+    profile.Add(profile.quiet_ns, stage);
+    stage = profile.Now();
     // SO markers cover payload only. Metadata AIVs can still be doing remote
     // SIMT stores on another rank; all ranks/cores must join before outputs are
     // read or the workspace is reused. The collective includes local sync.
     aclshmemi_sync_npu_v4<true>(0);
+    profile.Add(profile.barrier_ns, stage);
+    // All sender/metadata readers have drained; the initial WQE area can now
+    // stage this AIV's private diagnostic record before output-copy reuse.
+    profile.Store(td.udma_profile_output, core, resource.template GetBufferByByte<uint64_t>(0));
 }
 template <class Resource>
 __aicore__ inline void DispatchRemote(
     Resource& r, GM_ADDR x, GM_ADDR scales, GM_ADDR plan, GM_ADDR rp, GM_ADDR cp,
-    GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores)
+    GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores, DispatchProfile& profile)
 {
     if (td.udma_qps_per_worker == 2) {
         if (td.udma_peer_order == kGroupRoundRobinOrder)
-            DispatchRemoteImpl<kGroupPeerCapacity, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+            DispatchRemoteImpl<kGroupPeerCapacity, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, profile);
         else
-            DispatchRemoteImpl<kMaxPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+            DispatchRemoteImpl<kMaxPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, profile);
     } else if (td.udma_peer_order == kGroupRoundRobinOrder)
-        DispatchRemoteImpl<kGroupPeerCapacity, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+        DispatchRemoteImpl<kGroupPeerCapacity, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, profile);
     else
-        DispatchRemoteImpl<kMaxPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+        DispatchRemoteImpl<kMaxPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, profile);
 }
 #endif
 } // namespace ascend_deepep::udma

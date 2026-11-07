@@ -33,6 +33,10 @@ struct int_with_bits<64> {
 
 using topk_idx_t = int_with_bits<EP_NUM_TOPK_IDX_BITS>::type;
 
+inline constexpr uint32_t kDispatchWqeCache = 1U;
+inline constexpr uint32_t kDispatchProfile = 2U;
+inline constexpr uint32_t kDispatchProfileWords = 32U; // 256-byte private row per AIV.
+
 struct alignas(8) DispatchLayoutTilingData {
     uint32_t rank;
     uint32_t world_size;
@@ -68,7 +72,7 @@ struct alignas(8) DispatchTilingData {
     uint32_t num_output_tokens;
     uint32_t needs_notify_entry_barrier;
     uint32_t needs_x_scales_pack;
-    uint32_t reserved;
+    uint32_t dispatch_experiment_flags; // Reuses the reserved ABI word; default zero.
     uint64_t scale_token_stride;
     uint64_t scale_hidden_stride;
     uint64_t notify_workspace_offset;
@@ -96,6 +100,7 @@ struct alignas(8) DispatchTilingData {
     uint64_t v2_dst_slots;
     // Buffer-owned symmetric address mailbox; never part of a cached handle.
     uint64_t udma_output_control;
+    uint64_t udma_profile_output = 0; // Diagnostic-only ordinary GM, never SHMEM.
 };
 
 struct alignas(8) CombineTilingData {

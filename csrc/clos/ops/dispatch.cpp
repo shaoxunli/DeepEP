@@ -2,7 +2,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <sstream>
+#include <unistd.h>
 
 #include <torch_npu/csrc/aten/common/from_blob.h>
 
@@ -15,6 +19,14 @@
 #include "runtime/shmem_instance.h"
 
 namespace {
+
+bool DispatchExperiment(const char* name)
+{
+    const char* value = std::getenv(name);
+    if (!value || !*value || std::strcmp(value, "0") == 0) return false;
+    TORCH_CHECK(std::strcmp(value, "1") == 0, name, " must be 0 or 1");
+    return true;
+}
 
 constexpr int64_t kDispatchLayoutUbBytes = ascend_deepep::platform::kKernelUbBytes;
 constexpr int64_t kDispatchLayoutReduceBufferCount = 2;
@@ -561,6 +573,13 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
+    tiling.dispatch_experiment_flags =
+        (DispatchExperiment("DEEPEP_CLOS_DISPATCH_WQE_CACHE") ? ascend_deepep::kDispatchWqeCache : 0U) |
+        (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PROFILE") ? ascend_deepep::kDispatchProfile : 0U);
+    TORCH_CHECK(!tiling.dispatch_experiment_flags || (use_udma && !tiling.udma_token_schedule),
+                "Clos dispatch experiments require the UDMA peer schedule");
+    TORCH_CHECK(!(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchProfile) || !capturing,
+                "Clos dispatch profiling performs a CPU readback and cannot be graph-captured");
     tiling.rank_stride = static_cast<uint32_t>(rank_stride);
     tiling.expert_stride = static_cast<uint32_t>(expert_stride);
     tiling.channel_stride = static_cast<uint32_t>(channel_stride);
@@ -656,10 +675,37 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // Dispatch writes every valid source index. Fixed-capacity tails are
     // unspecified; consumers select valid rows by rank/channel prefixes.
     auto recv_src_idx = allocator.Empty({cached_mode ? 0 : num_recv_tokens}, int_options);
+    torch::Tensor profile_output;
+    if (tiling.dispatch_experiment_flags & ascend_deepep::kDispatchProfile) {
+        profile_output =
+            allocator.Empty({resolved_num_aiv, ascend_deepep::kDispatchProfileWords}, x.options().dtype(torch::kInt64));
+        tiling.udma_profile_output = reinterpret_cast<uint64_t>(profile_output.data_ptr());
+    }
     LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
                            num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
                            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
                            send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma);
+    if (profile_output.defined()) {
+        // Diagnostic-only blocking readback. The tensor stays alive through
+        // completion on the execution stream; no public return values change.
+        auto cpu_profile = profile_output.cpu();
+        const auto* values = cpu_profile.data_ptr<int64_t>();
+        constexpr const char* names[] = {
+            "begin_ns",   "metadata_ns", "setup_ns", "plan_ns",    "send_ns", "build_ns", "credit_ns", "submit_ns",
+            "publish_ns", "incoming_ns", "quiet_ns", "barrier_ns", "refills", "hits",     "wqes",      "batches"};
+        for (int64_t core = 0; core < resolved_num_aiv; ++core) {
+            std::ostringstream line;
+            line << "[CLOS_DISPATCH_PROFILE] rank=" << rank << " core=" << core << " cached=" << cached_mode
+                 << " wqe_cache=" << bool(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchWqeCache);
+            for (uint32_t word = 0; word < sizeof(names) / sizeof(names[0]); ++word)
+                line << ' ' << names[word] << '=' << values[core * ascend_deepep::kDispatchProfileWords + word];
+            // One short write keeps records from different torchrun processes
+            // intact; unbuffered stdio may split one formatted line internally.
+            const auto message = line.str() + '\n';
+            TORCH_CHECK(::write(STDERR_FILENO, message.data(), message.size()) == static_cast<ssize_t>(message.size()),
+                        "Failed to write Clos dispatch profiling record");
+        }
+    }
     return {recv_x,
             recv_x_scales,
             recv_topk_idx,

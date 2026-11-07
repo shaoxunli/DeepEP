@@ -3,6 +3,7 @@
 #include "kernels/common/udma_shared_sender.h"
 #include "common/types.h"
 #include "kernels/dispatch/udma_dispatch_output.h"
+#include "kernels/dispatch/udma_dispatch_profile.h"
 #include "utils/debug/asc_assert.h"
 
 namespace ascend_deepep::udma {
@@ -10,6 +11,10 @@ inline constexpr uint32_t kDispatchBasesOffset = kSenderScratchBytes;
 inline constexpr uint32_t kDispatchEpochOffset = kDispatchBasesOffset + kMaxPeers * kOutputRecordBytes;
 inline constexpr uint32_t kDispatchSenderBytes = kDispatchEpochOffset + 32;
 static_assert(kDispatchSenderBytes % 32 == 0);
+// Eight direct-mapped entries per AIV; collisions flush pending readers before
+// replacement. Each entry holds 32 complete, unsignaled WQEs (16 KiB total).
+inline constexpr uint32_t kDispatchCacheEntries = 8;
+inline constexpr uint32_t kDispatchCacheBytes = kDispatchCacheEntries * kBatchWqes * kWqeBytes;
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 // Spans reference the immutable GM plan, so a list-window refill never forces
@@ -58,6 +63,23 @@ __simt_vf__ __launch_bounds__(32) inline void BuildDispatchWqes(
     __asc_simt_vf::__trap();
 }
 
+__simt_vf__ __launch_bounds__(32) inline void GatherDispatchCachedWqes(
+    __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* spans, uint32_t span_count, uint32_t count)
+{
+    const uint32_t i = threadIdx.x;
+    if (i >= count) return;
+    for (uint32_t s = 0; s < span_count; ++s) {
+        auto* span = spans + s * 4U;
+        const uint32_t begin = static_cast<uint32_t>(span[3]);
+        const uint32_t length = static_cast<uint32_t>(span[1]);
+        if (i < begin || i - begin >= length) continue;
+        auto* src = reinterpret_cast<__ubuf__ uint64_t*>(span[0]) + (i - begin) * 8U;
+        for (uint32_t word = 0; word < 8; ++word) wqes[i * 8U + word] = src[word];
+        return;
+    }
+    __asc_simt_vf::__trap();
+}
+
 template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1>
 class DispatchSenderT : public SenderT<Capacity, Qps> {
     using Base = SenderT<Capacity, Qps>;
@@ -65,17 +87,19 @@ class DispatchSenderT : public SenderT<Capacity, Qps> {
     using Base::active_state_; using Base::last_;
     static constexpr uint32_t kDispatchBasesOffset = kHeadersOffset + Capacity * Qps * 2U * kWqeBytes;
     static constexpr uint32_t kDispatchEpochOffset = kDispatchBasesOffset + Capacity * Qps * kOutputRecordBytes;
+    static constexpr uint32_t kCacheOffset = kDispatchEpochOffset + 32;
 public:
     __aicore__ DispatchSenderT(
         const DispatchTilingData& td, uint32_t core, AscendC::LocalTensor<uint8_t> scratch, GM_ADDR workspace, GM_ADDR x,
-        GM_ADDR scales, uint32_t peer_start = UINT32_MAX, uint32_t rotation = 0)
+        GM_ADDR scales, uint32_t peer_start = UINT32_MAX, uint32_t rotation = 0, DispatchProfile* profile = nullptr)
         : Base(td.rank, td.world_size, core,
               peer_start == UINT32_MAX ? td.udma_peers_per_worker : kMaxPeers,
               reinterpret_cast<__ubuf__ uint8_t*>(scratch.GetPhyAddr()), workspace, td.udma_completion_signal_offset, peer_start, rotation, td.udma_peer_order, td.udma_ranks_per_group,
               peer_start == UINT32_MAX ? td.udma_workers_per_peer : 1U),
           td_(td),
           x_(reinterpret_cast<uint64_t>(x)),
-          scales_(reinterpret_cast<uint64_t>(scales))
+          scales_(reinterpret_cast<uint64_t>(scales)), profile_(profile),
+          cache_enabled_((td.dispatch_experiment_flags & kDispatchWqeCache) != 0)
     {
         auto* bases = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset);
         if (!td.udma_output_control) {
@@ -128,14 +152,16 @@ public:
             }
     }
 
-    __aicore__ uint32_t PutRows(uint32_t p, const __gm__ int32_t* indices, uint32_t row, uint32_t field, uint32_t count)
+    __aicore__ uint32_t PutRows(uint32_t p, const __gm__ int32_t* indices, uint32_t row, uint32_t field,
+        uint32_t count, uint32_t available = 0)
     {
         p = Base::QueuePeer(p);
+        if (cache_enabled_) return PutCachedRows(p, indices, row, field, count, available);
         if (rows_pending_ && active_state_ != peers_[p].state)
             Flush();
         if (!rows_pending_) {
             active_state_ = peers_[p].state;
-            Base::EnsurePayloadCredit(p);
+            Credit(p);
         }
         const uint32_t n = count < kBatchWqes - rows_pending_ ? count : kBatchWqes - rows_pending_;
         auto* span = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + spans_ * 4U;
@@ -155,9 +181,13 @@ public:
     {
         if (!rows_pending_)
             return;
+        const uint64_t started = Now();
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
-        asc_vf_call<BuildDispatchWqes>(
+        if (cache_enabled_) {
+            asc_vf_call<GatherDispatchCachedWqes>(dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
+                reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset), spans_, rows_pending_);
+        } else asc_vf_call<BuildDispatchWqes>(
             dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset),
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
@@ -167,9 +197,23 @@ public:
             rows_pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+        if (profile_ && profile_->enabled) {
+            // V_MTE3 orders the copy engine, not the scalar timer. Diagnostic
+            // runs drain SIMT here so its execution is not charged to submit.
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            profile_->Add(profile_->build_ns, started);
+        }
+        const uint64_t submitted = Now();
         Base::SubmitPayload(rows_pending_);
+        if (profile_ && profile_->enabled) {
+            profile_->Add(profile_->submit_ns, submitted);
+            profile_->wqes += rows_pending_;
+            ++profile_->batches;
+        }
         rows_pending_ = 0;
         spans_ = 0;
+        cache_readers_ = 0;
     }
 
     // One visit is at most udma_wqes_per_visit WQEs for one peer.
@@ -190,8 +234,83 @@ public:
     }
 
 private:
+    __aicore__ uint64_t Now() const { return profile_ ? profile_->Now() : 0; }
+    __aicore__ void Credit(uint32_t p) {
+        const uint64_t started = Now();
+        Base::EnsurePayloadCredit(p);
+        if (profile_) profile_->Add(profile_->credit_ns, started);
+    }
+    struct CacheEntry {
+        uint64_t next_indices = 0;
+        uint32_t peer = UINT32_MAX, next_row = 0, next_field = 0, cursor = 0, count = 0;
+    };
+    __aicore__ uint32_t PutCachedRows(uint32_t p, const __gm__ int32_t* indices, uint32_t row,
+        uint32_t field, uint32_t count, uint32_t available)
+    {
+        const uint32_t fields = td_.has_x_scales && td_.num_scales && td_.scale_element_bytes ? 2U : 1U;
+        if (!count || available < count || field >= fields) { trap(); return 0; }
+        const uint32_t slot = p % kDispatchCacheEntries;
+        auto& entry = cache_[slot];
+        auto* built = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kCacheOffset + slot * kBatchWqes * kWqeBytes);
+        const bool hit = entry.peer == p && entry.next_indices == reinterpret_cast<uint64_t>(indices) &&
+            entry.next_row == row && entry.next_field == field && entry.cursor < entry.count;
+        if (!hit) {
+            // Only an entry referenced by this pending batch needs a drain.
+            // Use the consumed epoch scratch as a separate refill descriptor,
+            // so a first visit to another peer never destroys pending spans.
+            if (cache_readers_ & (1U << slot)) Flush();
+            const uint64_t started = Now();
+            const uint32_t fill = available < kBatchWqes ? available : kBatchWqes;
+            auto* span = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchEpochOffset);
+            span[0] = reinterpret_cast<uint64_t>(indices);
+            span[1] = uint64_t(row) | (uint64_t(fill) << 32U);
+            span[2] = uint64_t(p) | (uint64_t(field) << 32U);
+            span[3] = 0;
+            AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
+            asc_vf_call<BuildDispatchWqes>(dim3(32), built, span,
+                reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
+                reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset), x_, scales_,
+                td_.hidden * td_.x_element_bytes, td_.num_scales * td_.scale_element_bytes,
+                td_.num_tokens, fields, 1U, fill);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            entry = {reinterpret_cast<uint64_t>(indices), p, row, field, 0, fill};
+            if (profile_ && profile_->enabled) {
+                profile_->Add(profile_->build_ns, started);
+                ++profile_->refills;
+            }
+        } else if (profile_ && profile_->enabled) ++profile_->hits;
+        if (rows_pending_ && active_state_ != peers_[p].state) Flush();
+        if (!rows_pending_) {
+            active_state_ = peers_[p].state;
+            // The checkpoint may overwrite the batch buffer, but not cache.
+            Credit(p);
+        }
+        uint32_t n = count < entry.count - entry.cursor ? count : entry.count - entry.cursor;
+        n = n < kBatchWqes - rows_pending_ ? n : kBatchWqes - rows_pending_;
+        auto* span = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + spans_ * 4U;
+        span[0] = reinterpret_cast<uint64_t>(built + entry.cursor * 8U);
+        span[1] = n;
+        span[2] = 0;
+        span[3] = rows_pending_;
+        ++spans_;
+        rows_pending_ += n;
+        cache_readers_ |= 1U << slot;
+        entry.cursor += n;
+        entry.next_indices += uint64_t((field + n) / fields) * sizeof(int32_t);
+        entry.next_row += (field + n) / fields;
+        entry.next_field = (field + n) % fields;
+        last_ = p;
+        if (rows_pending_ == kBatchWqes) Flush();
+        return n;
+    }
     const DispatchTilingData& td_;
     uint64_t x_, scales_;
+    DispatchProfile* profile_;
+    bool cache_enabled_;
+    CacheEntry cache_[kDispatchCacheEntries]{};
+    uint32_t cache_readers_ = 0;
     uint32_t rows_pending_ = 0, spans_ = 0;
     uint32_t next_qp_[Qps == 2 ? Capacity : 1]{};
 };
