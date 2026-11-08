@@ -162,3 +162,32 @@ The cursor CPU regression executes the actual scheduler against independently
 calculated output-row ownership, covering empty and skew peers/channels,
 partial sends, payload/scales, weighted/unweighted lanes and varied visits.
 NPU precision and performance evidence must still be collected separately.
+
+## Huge-page receive placement
+
+`DEEPEP_CLOS_DISPATCH_RECV_WORKSPACE=1` redirects dispatch payload and scale
+receive targets to the existing 1 GiB-page workspace, then copies them to owned
+output tensors on the execution stream. Default is `0`. This is a diagnostic
+experiment, not a zero-copy API: metadata destinations, kernel code, tiling ABI,
+peer row ownership, and completion protocol are unchanged. It requires the
+UDMA peer schedule and huge pages; zero-copy outputs, graph capture, and
+workspace-backed payload inputs are rejected before notification.
+
+The existing checked layout reserves disjoint, 32-byte-aligned payload and
+scale regions for the common receive capacity. The actual output count cannot
+exceed this capacity. Remote writes and local copies use the existing output
+mailbox and row ownership. Kernel completion, including incoming completion,
+Quiet, and epilogue, precedes the materialization copies on the same stream.
+The public completion event follows the copies. Subsequent serialized calls
+and their entry rendezvous protect workspace reuse; returned tensors retain
+ordinary allocator ownership and survive later dispatch/combine calls. No new
+UB storage or device synchronization is introduced.
+
+One `CLOS_DISPATCH_RECV_WORKSPACE` record per process confirms the enabled
+path. The bandwidth benchmark checks that an earlier fresh result survives a
+cached dispatch with different payload. Compare identical huge-page settings
+with this switch off/on. Report both communication kernel duration and the
+additional materialization cost (`other_us` in the profiler), as well as the
+device/API interval where available. A shorter communication kernel alone is
+not an end-to-end speedup, and this comparison changes receive placement as
+well as the memory mapping; it does not isolate page size alone.

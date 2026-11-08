@@ -603,6 +603,9 @@ def _worker(args):
         del expert_ref
         cached = wait(dispatch(cached_x, handle))
         check_dispatch(cached, delta=1, cached=True)
+        if os.environ.get("DEEPEP_CLOS_DISPATCH_RECV_WORKSPACE") == "1":
+            # Different cached payload must not overwrite the earlier owned output.
+            check_dispatch(fresh)
         del cached
         bias0 = bias1 = bias = None
         if args.combine_bias == "two":
@@ -661,6 +664,7 @@ def _worker(args):
                 passed=True,
                 fresh=True,
                 cached=True,
+                fresh_retained_after_cached=os.environ.get("DEEPEP_CLOS_DISPATCH_RECV_WORKSPACE") == "1",
                 combine_unweighted=True,
                 combine_weighted=True,
                 combine_bias=args.combine_bias,

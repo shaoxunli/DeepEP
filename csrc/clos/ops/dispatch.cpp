@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <unistd.h>
 
@@ -350,6 +351,23 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // NPU tensors/allocator already established the context. The non-initializing
     // inline wrapper references a private symbol in torch_npu 2.7.1.post10.
     const bool capturing = c10_npu::currentStreamCaptureStatusMayInitCtx() != c10_npu::CaptureStatus::None;
+    const bool recv_workspace = DispatchExperiment("DEEPEP_CLOS_DISPATCH_RECV_WORKSPACE");
+    if (recv_workspace) {
+        TORCH_CHECK(use_udma && !shmem.TokenSchedule() && shmem.Use1gHugePages(),
+                    "Dispatch receive-workspace experiment requires the UDMA peer schedule and 1 GiB huge pages");
+        TORCH_CHECK(!zero_copy && !capturing,
+                    "Dispatch receive-workspace experiment requires owned outputs and cannot be graph-captured");
+        TORCH_CHECK(symmetric_buffer == shmem.WorkspacePtr(),
+                    "Dispatch receive workspace must be the huge-page allocation");
+        // A prior zero-copy output cannot also be this invocation's source.
+        const auto base = reinterpret_cast<uintptr_t>(symmetric_buffer);
+        for (const auto& input : {c10::optional<torch::Tensor>(x), x_scales}) {
+            if (!input.has_value() || input->numel() == 0) continue;
+            const auto address = reinterpret_cast<uintptr_t>(input->data_ptr());
+            TORCH_CHECK(address < base || address - base >= symmetric_buffer_bytes,
+                        "Dispatch receive-workspace experiment does not accept workspace-backed payload inputs");
+        }
+    }
     TORCH_CHECK(!capturing || cached_mode || num_worst_tokens > 0, "NPU graph dispatch requires num_worst_tokens > 0");
     const int64_t hidden = x.size(1);
     const int64_t num_topk = topk_idx.has_value() ? topk_idx->size(1) : 0;
@@ -693,10 +711,34 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         profile_output = allocator.Empty({resolved_num_aiv, profile_stride}, x.options().dtype(torch::kInt64));
         tiling.udma_profile_output = reinterpret_cast<uint64_t>(profile_output.data_ptr());
     }
+    // Use the existing checked, disjoint payload/scale regions only as temporary
+    // receive targets. Metadata and public outputs keep their ordinary ownership.
+    auto target_x = recv_workspace ? MakeShmemTensor(symmetric_buffer, dispatch_workspace.x_buffer_offset,
+                                                     {num_recv_tokens, hidden}, x.scalar_type())
+                                   : recv_x;
+    auto target_scales = recv_x_scales;
+    if (recv_workspace && x_scales.has_value()) {
+        target_scales = MakeShmemTensor(symmetric_buffer, dispatch_workspace.x_scales_buffer_offset,
+                                        {num_recv_tokens, num_scales}, x_scales->scalar_type());
+    }
     LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
-                           num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
+                           num_tokens_per_expert, target_x, target_scales, recv_topk_idx, recv_topk_weights,
                            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
                            send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma);
+    if (recv_workspace) {
+        // Same execution stream: kernel completion precedes materialization,
+        // which precedes the public completion event and subsequent workspace
+        // reuse. The returned tensors never alias the reusable SHMEM allocation.
+        recv_x.copy_(target_x);
+        if (recv_x_scales.has_value()) recv_x_scales->copy_(*target_scales);
+        static std::once_flag logged;
+        std::call_once(logged, [rank] {
+            const auto line = "[CLOS_DISPATCH_RECV_WORKSPACE] rank=" + std::to_string(rank) +
+                              " enabled=1 huge_pages=1 materialize=1\n";
+            TORCH_CHECK(::write(STDERR_FILENO, line.data(), line.size()) == static_cast<ssize_t>(line.size()),
+                        "Failed to write dispatch receive-workspace configuration");
+        });
+    }
     if (profile_output.defined()) {
         // Diagnostic-only blocking readback. The tensor stays alive through
         // completion on the execution stream; no public return values change.
