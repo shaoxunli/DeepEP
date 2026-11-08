@@ -69,7 +69,7 @@ def arguments(argv=None, *, description=None):
     )
     p.add_argument("--tuning-visits", type=int, nargs="+", choices=(4, 8, 16, 32), default=[8, 16, 32])
     p.add_argument("--tuning-workers", type=int, choices=(1, 2), default=2)
-    p.add_argument("--tuning-cross-lane0-weight", type=int, choices=(1, 3), default=3)
+    p.add_argument("--tuning-cross-lane0-weight", type=int, choices=range(1, 9), default=3)
     p.add_argument(
         "--flush-l2-cache",
         action=argparse.BooleanOptionalAction,

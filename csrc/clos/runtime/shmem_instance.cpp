@@ -138,8 +138,8 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
         throw std::invalid_argument(
             "two QPs per worker require shared-Jetty UDMA peer schedule and one worker per peer");
     qps_per_worker_ = static_cast<uint32_t>(udma_qps_per_worker);
-    if (udma_cross_lane0_weight != 1 && udma_cross_lane0_weight != 3)
-        throw std::invalid_argument("udma_cross_lane0_weight must be 1 or 3");
+    if (udma_cross_lane0_weight < 1 || udma_cross_lane0_weight > 8)
+        throw std::invalid_argument("udma_cross_lane0_weight must be an integer in [1, 8]");
     if (udma_cross_lane0_weight != 1 && (workers_per_peer_ != 2 || qps_per_worker_ != 1 || ranks_per_group_ == 0))
         throw std::invalid_argument("weighted cross lanes require two workers, one QP each and an explicit group size");
     cross_lane0_weight_ = static_cast<uint32_t>(udma_cross_lane0_weight);

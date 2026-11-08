@@ -333,8 +333,15 @@ def test_tuning_arguments_preserve_manual_policy_and_reject_oversubscription():
         cmd = worker_command(a, dict(name='bf16_expand0_aiv32_visit8',aiv=32,dtype='bf16',expand=0), Path('/tmp/test'))
         assert cmd[cmd.index('--tuning-order')+1] == 'group_round_robin'
         assert cmd[cmd.index('--tuning-cross-lane0-weight')+1] == '3'
+        for weight in range(1,9):
+            weighted = arguments(common + ['--tuning-order','group_round_robin',
+                                           '--tuning-cross-lane0-weight',str(weight)])
+            cmd = worker_command(weighted, dict(name='bf16_expand0_aiv32_visit8',aiv=32,dtype='bf16',expand=0), Path('/tmp/test'))
+            assert cmd[cmd.index('--tuning-cross-lane0-weight')+1] == str(weight)
         for invalid in (['--tuning-order','rank','--tuning-peers','2','--aiv','20'],
                         ['--tuning-order','rank','--tuning-workers','1'],
+                        ['--tuning-order','group_round_robin','--tuning-cross-lane0-weight','0'],
+                        ['--tuning-order','group_round_robin','--tuning-cross-lane0-weight','9'],
                         ['--tuning-order','group_round_robin','--tuning-peers','8']):
             try: arguments(common + invalid)
             except SystemExit as e: assert e.code == 2
@@ -358,7 +365,7 @@ using ascend_deepep::udma::PeerRowBoundary;
 int main() {
   for (uint32_t count = 0; count < 4096; ++count) {
     for (uint32_t peer : {1U, 8U, 31U}) {
-      for (uint32_t weight : {1U, 3U}) {
+      for (uint32_t weight : {1U, 2U, 3U, 4U, 5U, 8U}) {
         uint32_t cut = PeerRowBoundary(count, 1, 2, 0, peer, 8, weight);
         assert(cut == count * (peer < 8 ? 1 : weight) / (peer < 8 ? 2 : weight + 1));
         assert(PeerRowBoundary(count, 0, 2, 0, peer, 8, weight) == 0);
@@ -382,6 +389,12 @@ int main() {
       }
     }
   }
+  for (uint32_t count : {0x7fffffffU, 0xfffffffeU, 0xffffffffU})
+    for (uint32_t weight = 1; weight <= 8; ++weight) {
+      const auto cut = PeerRowBoundary(count, 1, 2, 0, 8, 8, weight);
+      assert(cut == uint64_t(count) * weight / (weight + 1));
+      assert(cut <= count && cut + (count - cut) == count);
+    }
 }
 """.replace("#include <cassert>", "#include <cassert>\n#include <initializer_list>")
     )
@@ -728,7 +741,7 @@ struct Sender {
         + r"""
 int main() {
  for(unsigned tokens:{0,1,257,1025}) for(unsigned channels:{1,3,8})
- for(unsigned workers:{1,2}) for(unsigned weight:{1,3}) for(unsigned fields:{1,2})
+ for(unsigned workers:{1,2}) for(unsigned weight:{1,2,3,4,5,8}) for(unsigned fields:{1,2})
  for(unsigned visit:{4,8,16,32}) {
     DispatchTilingData td;td.num_channels=channels;td.udma_workers_per_peer=workers;
     td.udma_cross_lane0_weight=weight;td.udma_wqes_per_visit=visit;

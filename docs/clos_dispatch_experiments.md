@@ -191,3 +191,21 @@ additional materialization cost (`other_us` in the profiler), as well as the
 device/API interval where available. A shorter communication kernel alone is
 not an end-to-end speedup, and this comparison changes receive placement as
 well as the memory mapping; it does not isolate page size alone.
+
+## Manual cross-server lane weights
+
+`udma_cross_lane0_weight` accepts integer weights from 1 through 8. The default
+remains 1; the manual bandwidth benchmark keeps its previous default of 3 and
+accepts the range through `--tuning-cross-lane0-weight`. Automatic policy is
+unchanged. A non-unit weight requires manual mode, two workers per peer, one
+QP per worker, and an explicit contiguous physical-server group size. All
+ranks must agree on this immutable constructor setting during bootstrap.
+
+For a cross-server peer with `N` actual receive rows, lane 0 owns
+`[0, floor(uint64(N) * weight / (weight + 1)))` and lane 1 owns the remainder.
+Within the same server the weighted path retains a 1:1 split. Weight 1 retains
+the existing channel-based scheduling path. Empty lanes still publish their
+completion markers. This changes row ownership between the two workers, not
+the output row order, payload bytes, QP allocation, workspace layout, or
+completion protocol. Compare effective configurations and verify cross-server
+precision; a single-server run cannot validate the non-unit cross-server split.
