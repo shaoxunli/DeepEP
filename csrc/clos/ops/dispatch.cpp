@@ -404,7 +404,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
 
     const int64_t resolved_num_aiv = ResolveNumAiv(num_aiv);
     const int64_t num_channels = resolved_num_aiv;
-    if (shmem.DispatchPeerOrder() == ascend_deepep::udma::kGroupRoundRobinOrder)
+    if (ascend_deepep::udma::GroupOwnerOrder(shmem.DispatchPeerOrder()))
         udma_peers_per_worker = shmem.PeersPerGroupPerWorker();
     if (use_udma) {
         TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");

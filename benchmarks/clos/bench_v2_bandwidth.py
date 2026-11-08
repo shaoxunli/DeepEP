@@ -57,7 +57,7 @@ def arguments(argv=None, *, description=None):
     p.set_defaults(udma_auto_policy=True)
     p.add_argument(
         "--tuning-order",
-        choices=("rank", "group_round_robin"),
+        choices=("rank", "group_round_robin", "group_window"),
         help="V2 manual sweep; requires contiguous ranks per physical node",
     )
     p.add_argument(
@@ -65,7 +65,7 @@ def arguments(argv=None, *, description=None):
         type=int,
         choices=(1, 2, 4, 8),
         default=4,
-        help="peers per owner for rank order; local positions per owner for group_round_robin",
+        help="peers per owner for rank order; local positions per owner for group_round_robin/group_window",
     )
     p.add_argument("--tuning-visits", type=int, nargs="+", choices=(4, 8, 16, 32), default=[8, 16, 32])
     p.add_argument("--tuning-workers", type=int, choices=(1, 2), default=2)
@@ -168,8 +168,8 @@ def arguments(argv=None, *, description=None):
     if args.tuning_order:
         if "bench_v1" in Path(sys.argv[0]).stem:
             p.error("manual tuning sweep is currently supported by the V2 entrypoint")
-        if args.tuning_order == "group_round_robin" and args.tuning_peers == 8:
-            p.error("group_round_robin supports 1, 2 or 4 local positions per owner")
+        if args.tuning_order in ("group_round_robin", "group_window") and args.tuning_peers == 8:
+            p.error("group owner order supports 1, 2 or 4 local positions per owner")
         if args.tuning_workers == 1 and args.tuning_cross_lane0_weight != 1:
             p.error("3:1 split requires two workers")
         owners = (
@@ -483,7 +483,7 @@ def _worker(args):
                     udma_combine_peer_order=args.tuning_order,
                     udma_ranks_per_group=local_world_size(args),
                     udma_peers_per_group_per_worker=args.tuning_peers
-                    if args.tuning_order == "group_round_robin"
+                    if args.tuning_order in ("group_round_robin", "group_window")
                     else None,
                     udma_workers_per_peer=args.tuning_workers,
                     udma_qps_per_worker=1,

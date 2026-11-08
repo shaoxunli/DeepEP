@@ -48,9 +48,11 @@ def validate_manual_options(
         )
         if any(order is not None and order != "rank" for order in (dispatch_order, combine_order)):
             required["udma_ranks_per_group"] = ranks_per_group
-        if "group_round_robin" in (dispatch_order, combine_order):
+        if any(order in ("group_round_robin", "group_window") for order in (dispatch_order, combine_order)):
             required["udma_peers_per_group_per_worker"] = peers_per_group_per_worker
-        if not operation_config and (dispatch_order, combine_order) != ("group_round_robin", "group_round_robin"):
+        if not operation_config and any(
+            order not in ("group_round_robin", "group_window") for order in (dispatch_order, combine_order)
+        ):
             required["udma_peers_per_worker"] = peers
     if not operation_config:
         required["udma_wqes_per_visit"] = wqes
@@ -61,7 +63,9 @@ def validate_manual_options(
 
 def validate_manual_config(config, schedule, dispatch_order, combine_order):
     required = ["udma_wqes_per_visit"]
-    if schedule == "peer" and (dispatch_order, combine_order) != ("group_round_robin", "group_round_robin"):
+    if schedule == "peer" and any(
+        order not in ("group_round_robin", "group_window") for order in (dispatch_order, combine_order)
+    ):
         required.append("udma_peers_per_worker")
     flags = {"udma_wqes_per_visit": "_udma_wqes_explicit", "udma_peers_per_worker": "_udma_peers_explicit"}
     missing = [name for name in required if config is None or not getattr(config, flags[name], False)]

@@ -696,6 +696,75 @@ def test_tuning_visits_share_launcher_evidence(tmp_path):
     """)
 
 
+def test_window_order_validation_and_manual_options():
+    run_host("""
+        from deep_ep.backends.clos.buffer import _validate_udma_peer_order as check
+        from deep_ep.backends.clos.udma_policy import validate_manual_options
+        for orders in [('group_window','group_window'), ('group_round_robin','group_window'), ('group_window','rank')]:
+            got = check('udma', 'peer', 64, *orders, 8, 1, 2, 1)
+            assert got[0] == (4 if orders[0] == 'group_window' else 3)
+            validate_manual_options('peer', *orders, 8, 1, 2, 1, peers=4, wqes=4)
+        for size, group in [(24,8), (64,4), (12,4)]:
+            try:
+                check('udma', 'peer', size, 'group_window','group_window',group,1,2,1)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('accepted unsupported POD window topology')
+    """)
+
+
+def test_window_order_coverage_ownership_and_qps(tmp_path):
+    import shutil
+
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    source = tmp_path / "window.cpp"
+    source.write_text(r"""
+#include <algorithm>
+#include <cassert>
+#include <vector>
+#include "csrc/clos/common/udma_schedule.h"
+using namespace ascend_deepep::udma;
+int main() {
+ for(unsigned world:{8,16,32,64,128,256,512}) for(unsigned rank=0;rank<world;++rank)
+ for(unsigned peers:{1,2,4}) {
+  if(peers*(world/8)>64) continue;
+  std::vector<unsigned> seen(world);
+  for(unsigned owner=0;owner<Workers(world,peers,kGroupWindowOrder,8);++owner) {
+   std::vector<unsigned> actual,expected;
+   auto count=WorkerCount(rank,world,owner,peers,kGroupWindowOrder,8);
+   unsigned previous=0;
+   for(unsigned i=0;i<count;++i) {
+    unsigned peer=WorkerPeer(rank,world,owner,peers,i,kGroupWindowOrder,8);
+    assert(peer<world && peer!=rank && !seen[peer]++);
+    assert(Owner(rank,peer,world,peers,kGroupWindowOrder,8)==owner);
+    assert(Owner(rank,peer,world,peers,kGroupRoundRobinOrder,8)==owner);
+    unsigned window=PeerWindow(rank,peer,world,8);assert(window>=previous);previous=window;
+    actual.push_back(peer);
+    assert(PeerMask(rank,peer,world,4,4,8,peers,2)==PeerMask(rank,peer,world,3,3,8,peers,2));
+   }
+   // Independent POD source sequence, expanded to the owner's local positions.
+   for(unsigned j=0;j<world/8;++j) {
+    unsigned server;
+    if(world>=128) server=(rank/64 ^ (rank%8)/4 ^ j/8)*8+(rank/8+1+j%8)%8;
+    else if(world<32) server=(rank/8+1+j)%(world/8);
+    else server=(rank/32 ^ j/4)*4+(rank/8+1+j%4)%4;
+    for(unsigned local=owner;local<8;local+=Workers(world,peers,4,8))
+     if(server*8+local!=rank) expected.push_back(server*8+local);
+   }
+   assert(actual==expected);
+  }
+  for(unsigned p=0;p<world;++p) assert(seen[p]==unsigned(p!=rank));
+ }
+}
+""")
+    binary = tmp_path / "window"
+    subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(ROOT), str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
 def test_dispatch_peer_cursors_preserve_row_ownership(tmp_path):
     """Actual cursor scheduler versus independent per-row ownership, with partial sends."""
     import shutil
@@ -717,9 +786,9 @@ def test_dispatch_peer_cursors_preserve_row_ownership(tmp_path):
 #include "common/udma_schedule.h"
 #define __aicore__
 #define __gm__
-using ascend_deepep::udma::PeerRowBoundary;
+using namespace ascend_deepep::udma;
 struct DispatchTilingData {
-    uint32_t rank=1,world_size=16,num_channels=0,udma_workers_per_peer=0,
+    uint32_t rank=1,world_size=64,udma_peer_order=3,num_channels=0,udma_workers_per_peer=0,
         udma_cross_lane0_weight=0,udma_ranks_per_group=8,udma_wqes_per_visit=0;
 };
 struct Prefix { std::vector<int32_t> v; int32_t GetValue(unsigned i) {return v.at(i);} };
@@ -727,7 +796,8 @@ using Item=std::array<unsigned,4>;
 struct Sender {
     unsigned fields,visit,left=0,calls=0,active=0;
     std::vector<Item> sent;
-    unsigned Count() {return 4;} unsigned Rank(unsigned p) {return p*3;}
+    unsigned Count() {return 4;} unsigned Rank(unsigned p) {return std::array<unsigned,4>{0,16,40,48}[p];}
+    void Flush() {}
     void BeginVisit(unsigned p) {active=p;left=visit;}
     unsigned PutRows(unsigned p,const int32_t* indices,unsigned row,unsigned field,unsigned n,unsigned available) {
         assert(p==active && n && n<=left && n<=available);
@@ -742,16 +812,16 @@ struct Sender {
 int main() {
  for(unsigned tokens:{0,1,257,1025}) for(unsigned channels:{1,3,8})
  for(unsigned workers:{1,2}) for(unsigned weight:{1,2,3,4,5,8}) for(unsigned fields:{1,2})
- for(unsigned visit:{4,8,16,32}) {
-    DispatchTilingData td;td.num_channels=channels;td.udma_workers_per_peer=workers;
+ for(unsigned visit:{4,8,16,32}) for(unsigned order:{3,4}) {
+    DispatchTilingData td;td.udma_peer_order=order;td.num_channels=channels;td.udma_workers_per_peer=workers;
     td.udma_cross_lane0_weight=weight;td.udma_wqes_per_visit=visit;
     unsigned width=(tokens+channels-1)/channels,stride=(width+7)/8*8;
-    std::vector<int32_t> plan(16*channels*stride,-999);
-    Prefix rp,cp;rp.v.resize(256);cp.v.resize(16*channels);
-    for(unsigned peer=0;peer<16;++peer) rp.v[peer]=100+peer*10000;
+    std::vector<int32_t> plan(64*channels*stride,-999);
+    Prefix rp,cp;rp.v.resize(64*64);cp.v.resize(64*channels);
+    for(unsigned peer=0;peer<64;++peer) rp.v[peer]=100+peer*10000;
     std::vector<std::vector<Item>> expected(workers);
     for(unsigned p=0;p<4;++p) {
-        unsigned peer=p*3,total=0;std::vector<Item> all;std::vector<unsigned> chs;
+        unsigned peer=std::array<unsigned,4>{0,16,40,48}[p],total=0;std::vector<Item> all;std::vector<unsigned> chs;
         for(unsigned ch=0;ch<channels;++ch) {
             unsigned pos=0;
             for(unsigned t=ch*width;t<std::min(tokens,(ch+1)*width);++t) {
@@ -775,6 +845,10 @@ int main() {
     for(unsigned lane=0;lane<workers;++lane) {
         Sender sender{fields,visit};
         DispatchPeerCursors<8>(sender,td,lane,plan.data(),rp,cp,stride,fields);
+        if(order==4) {
+            unsigned previous=0;
+            for(auto item:sender.sent) {unsigned window=PeerWindow(td.rank,item[0],td.world_size,8);assert(window>=previous);previous=window;}
+        }
         std::sort(sender.sent.begin(),sender.sent.end());std::sort(expected[lane].begin(),expected[lane].end());
         assert(sender.sent==expected[lane]);
     }

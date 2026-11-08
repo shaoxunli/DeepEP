@@ -21,6 +21,40 @@ inline constexpr uint32_t kGroupOrder = 1;
 inline constexpr uint32_t kGroupStaggeredOrder = 2;
 inline constexpr uint32_t kGroupRoundRobinOrder = 3;
 inline constexpr uint32_t kGroupPeerCapacity = 64;
+inline constexpr uint32_t kGroupWindowOrder = 4;
+
+ASCEND_DEEPEP_SCHEDULE_FN bool GroupOwnerOrder(uint32_t order)
+{
+    return order == kGroupRoundRobinOrder || order == kGroupWindowOrder;
+}
+// POD-compatible server windows. Host validation requires eight ranks/server
+// and a power-of-two server count; ownership is independent of window order.
+ASCEND_DEEPEP_SCHEDULE_FN uint32_t ServerWindowWidth(uint32_t world, uint32_t ranks_per_group)
+{
+    const uint32_t groups = world / ranks_per_group;
+    return groups < 4U ? groups : (groups < 16U ? 4U : 8U);
+}
+ASCEND_DEEPEP_SCHEDULE_FN uint32_t ServerWindowShift(uint32_t rank, uint32_t world)
+{
+    return world >= 128U ? (rank % 8U) / 4U : 0U;
+}
+ASCEND_DEEPEP_SCHEDULE_FN uint32_t PeerWindow(uint32_t rank, uint32_t peer, uint32_t world,
+    uint32_t ranks_per_group)
+{
+    const uint32_t width = ServerWindowWidth(world, ranks_per_group);
+    return (rank / ranks_per_group / width) ^ (peer / ranks_per_group / width) ^
+           ServerWindowShift(rank, world);
+}
+template <class Sender>
+ASCEND_DEEPEP_SCHEDULE_FN uint32_t PeerWindowEnd(Sender& sender, uint32_t rank, uint32_t world,
+    uint32_t ranks_per_group, uint32_t order, uint32_t begin)
+{
+    if (order != kGroupWindowOrder) return sender.Count();
+    uint32_t end = begin + 1U;
+    const uint32_t window = PeerWindow(rank, sender.Rank(begin), world, ranks_per_group);
+    while (end < sender.Count() && PeerWindow(rank, sender.Rank(end), world, ranks_per_group) == window) ++end;
+    return end;
+}
 
 // Ordinary GM diagnostic rows; all record strides are 32-byte aligned.
 inline constexpr uint32_t kTraceSendWords = 12;
@@ -44,7 +78,7 @@ ASCEND_DEEPEP_SCHEDULE_FN bool ValidVisit(uint32_t wqes)
 ASCEND_DEEPEP_SCHEDULE_FN uint32_t Workers(uint32_t world, uint32_t peers,
     uint32_t order = kRankOrder, uint32_t ranks_per_group = 0)
 {
-    if (order == kGroupRoundRobinOrder)
+    if (GroupOwnerOrder(order))
         return (ranks_per_group + peers - 1) / peers;
     return (world - 1 + peers - 1) / peers;
 }
@@ -87,7 +121,7 @@ ASCEND_DEEPEP_SCHEDULE_FN uint32_t WorkerCount(
 {
     const uint32_t workers = Workers(world, peers, order, ranks_per_group);
     if (owner >= workers) return 0;
-    if (order == kGroupRoundRobinOrder) {
+    if (GroupOwnerOrder(order)) {
         const uint32_t locals = (ranks_per_group - 1 - owner) / workers + 1;
         return locals * (world / ranks_per_group) - uint32_t(rank % ranks_per_group % workers == owner);
     }
@@ -111,7 +145,7 @@ ASCEND_DEEPEP_SCHEDULE_FN uint32_t Owner(
     uint32_t rank, uint32_t peer, uint32_t world, uint32_t peers,
     uint32_t order = kRankOrder, uint32_t ranks_per_group = 0)
 {
-    if (order == kGroupRoundRobinOrder)
+    if (GroupOwnerOrder(order))
         return (peer % ranks_per_group) % Workers(world, peers, order, ranks_per_group);
     if (order == kRankOrder)
         return ((peer + world - rank - 1) % world) / peers;
@@ -127,10 +161,20 @@ ASCEND_DEEPEP_SCHEDULE_FN uint32_t WorkerPeer(
     uint32_t rank, uint32_t world, uint32_t owner, uint32_t peers, uint32_t index,
     uint32_t order = kRankOrder, uint32_t ranks_per_group = 0)
 {
-    if (order == kGroupRoundRobinOrder) {
+    if (GroupOwnerOrder(order)) {
         const uint32_t workers = Workers(world, peers, order, ranks_per_group);
         const uint32_t locals = (ranks_per_group - 1 - owner) / workers + 1;
         const uint32_t groups = world / ranks_per_group;
+        if (order == kGroupWindowOrder) {
+            const uint32_t width = ServerWindowWidth(world, ranks_per_group);
+            const uint32_t shift = ServerWindowShift(rank, world);
+            const uint32_t self = (shift * width + width - 1U) * locals + (rank % ranks_per_group) / workers;
+            const uint32_t ordinal = index + uint32_t(rank % ranks_per_group % workers == owner && index >= self);
+            const uint32_t server_index = ordinal / locals;
+            const uint32_t stage = (rank / ranks_per_group / width) ^ shift ^ (server_index / width);
+            const uint32_t target = stage * width + (rank / ranks_per_group + 1U + server_index % width) % width;
+            return target * ranks_per_group + owner + ordinal % locals * workers;
+        }
         const uint32_t self = (groups - 1) * locals + (rank % ranks_per_group) / workers;
         const uint32_t ordinal = index + uint32_t(rank % ranks_per_group % workers == owner && index >= self);
         const uint32_t target = (rank / ranks_per_group + 1 + ordinal / locals) % groups;
@@ -155,7 +199,7 @@ ASCEND_DEEPEP_SCHEDULE_FN uint64_t PeerMask(
     for (uint32_t peers = 1; peers <= kMaxPeers; peers *= 2) {
         for (uint32_t op = 0; op < 2; ++op) {
             const uint32_t order = op ? combine_order : dispatch_order;
-            const uint32_t count = order == kGroupRoundRobinOrder ? peers_per_group : peers;
+            const uint32_t count = GroupOwnerOrder(order) ? peers_per_group : peers;
             if (Workers(world, count, order, ranks_per_group) * workers_per_peer <= kQpCount) {
                 for (uint32_t lane = 0; lane < workers_per_peer; ++lane) {
                     mask |= uint64_t{1} << (Owner(rank, peer, world, count, order, ranks_per_group) * workers_per_peer + lane);

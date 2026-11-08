@@ -161,7 +161,7 @@ buffer = deep_ep.ElasticBuffer(
 ```
 
 V1 的 peers/worker 和 WQEs/visit 放在每次调用的 `Config` 中，其余参数在 Buffer 构造时设置。
-group 顺序还需 `udma_ranks_per_group`；group_round_robin 还需
+group 顺序还需 `udma_ranks_per_group`；group_round_robin / group_window 还需
 `udma_peers_per_group_per_worker`。MTE 不启用 UDMA 自动策略。
 
 UDMA 控制区固定在工作区开头，每个源 rank 保留 512 字节（256 字节对齐），
@@ -170,7 +170,7 @@ dispatch/combine 数据区与容量计算同步后移。普通 combine 省去前
 cached dispatch、MTE 和需要独立初始化的实验路径保留对应 notify。
 这些改动需要整体重编 Python/native/device 库，不能只替换 Python 文件。
 
-Clos 仅保留两个精度与带宽入口，均使用库的默认自动调度策略，不提供手动调度或参数扫描：
+Clos 提供两个精度与带宽入口，默认使用自动调度策略；V2 还支持显式调优参数，见[性能说明](performance.md)：
 
 ```bash
 python benchmarks/clos/bench_v1_bandwidth.py --ep-size 8 --output clos_v1_ep8

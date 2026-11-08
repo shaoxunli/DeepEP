@@ -111,3 +111,26 @@ empty, and all participating AIVs still reach the existing barriers.
 The runtime validates and agrees the split parameter before initialization.
 QP lane numbering alone does not establish physical port placement; verify it
 against the SHMEM SDK used for measurements.
+
+### POD window traversal
+
+`--tuning-order group_window` enables window traversal for both dispatch and
+combine. It keeps the `group_round_robin` local-position owner, worker count,
+QP mapping and row split. Eight contiguous EP ranks must describe each server,
+and the number of servers must be a power of two. Through EP64, each window
+contains four servers (clamped for smaller groups). EP128 and above use the
+POD eight-server stage order, staggered by the source local-rank half.
+
+Each peer receives at most the configured WQEs per visit. The sender repeatedly
+visits peers in the current window until their assigned rows have been submitted,
+then flushes WQE staging and advances. This is not a per-window completion wait
+or barrier. Same-server peers remain covered; only self is omitted. Dispatch
+uses independent peer cursors across channel boundaries. Combine retains its
+index windows, optional weights and aggregate-readiness waits. Final publication,
+incoming completion and quiet are unchanged. The window controls UDMA payload;
+separately issued SIMT weights retain their existing traversal. Automatic policy
+stays unchanged.
+
+Compare both orders with identical peers, workers, lane weights, visits, AIV
+count, input routes and byte/timing definitions. Window size counts servers;
+`--tuning-visits` counts WQEs, not servers.

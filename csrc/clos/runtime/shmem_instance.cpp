@@ -111,8 +111,8 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
       workspace_ptr_(nullptr),
       ffts_addr_(0)
 {
-    if (udma_dispatch_peer_order < 0 || udma_dispatch_peer_order > 3 || udma_combine_peer_order < 0 ||
-        udma_combine_peer_order > 3) {
+    if (udma_dispatch_peer_order < 0 || udma_dispatch_peer_order > 4 || udma_combine_peer_order < 0 ||
+        udma_combine_peer_order > 4) {
         throw std::invalid_argument("invalid UDMA peer order");
     }
     const bool topology_order = udma_dispatch_peer_order != 0 || udma_combine_peer_order != 0;
@@ -145,24 +145,31 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
     cross_lane0_weight_ = static_cast<uint32_t>(udma_cross_lane0_weight);
     const uint32_t qp_lanes = workers_per_peer_ * qps_per_worker_;
     if (qp_lanes != 1 &&
-        (dispatch_peer_order_ != ascend_deepep::udma::kGroupRoundRobinOrder ||
-         combine_peer_order_ != ascend_deepep::udma::kGroupRoundRobinOrder) &&
+        (!ascend_deepep::udma::GroupOwnerOrder(dispatch_peer_order_) ||
+         !ascend_deepep::udma::GroupOwnerOrder(combine_peer_order_)) &&
         ascend_deepep::udma::Workers(world_size, ascend_deepep::udma::kMaxPeers) * qp_lanes >
             ascend_deepep::udma::kQpCount)
         throw std::invalid_argument("no peer configuration fits the 32 sending QP limit");
-    const bool round_robin = dispatch_peer_order_ == ascend_deepep::udma::kGroupRoundRobinOrder ||
-                             combine_peer_order_ == ascend_deepep::udma::kGroupRoundRobinOrder;
+    const bool round_robin = ascend_deepep::udma::GroupOwnerOrder(dispatch_peer_order_) ||
+                             ascend_deepep::udma::GroupOwnerOrder(combine_peer_order_);
     if (round_robin) {
         if (udma_peers_per_group_per_worker != 1 && udma_peers_per_group_per_worker != 2 &&
             udma_peers_per_group_per_worker != 4)
-            throw std::invalid_argument("group_round_robin requires peers per group per worker in 1,2,4");
+            throw std::invalid_argument("group owner order requires peers per group per worker in 1,2,4");
         const uint64_t lanes =
             (udma_ranks_per_group + udma_peers_per_group_per_worker - 1) / udma_peers_per_group_per_worker;
         const uint64_t count = (udma_ranks_per_group + lanes - 1) / lanes * (world_size / udma_ranks_per_group);
         if (lanes * qp_lanes > ascend_deepep::udma::kQpCount || count > ascend_deepep::udma::kGroupPeerCapacity)
-            throw std::invalid_argument("group_round_robin exceeds 32 workers or 64 peers per worker");
+            throw std::invalid_argument("group owner order exceeds 32 workers or 64 peers per worker");
     } else if (udma_peers_per_group_per_worker != 0) {
-        throw std::invalid_argument("peers per group per worker requires group_round_robin");
+        throw std::invalid_argument("peers per group per worker requires a group owner order");
+    }
+    if (dispatch_peer_order_ == ascend_deepep::udma::kGroupWindowOrder ||
+        combine_peer_order_ == ascend_deepep::udma::kGroupWindowOrder) {
+        const uint32_t servers = ranks_per_group_ ? world_size / ranks_per_group_ : 0;
+        if (ranks_per_group_ != 8U || !servers || (servers & (servers - 1U)))
+            throw std::invalid_argument(
+                "group_window requires eight contiguous ranks per server and a power-of-two server count");
     }
     peers_per_group_per_worker_ = static_cast<uint32_t>(udma_peers_per_group_per_worker);
     if (token_schedule_ && !shared_jetty_) {

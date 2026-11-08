@@ -22,43 +22,49 @@ __aicore__ inline void DispatchPeerCursors(Sender& sender, const DispatchTilingD
     const uint32_t step = weighted ? 1U : td.udma_workers_per_peer;
     for (uint32_t p = 0; p < sender.Count(); ++p)
         cursor[p] = {weighted ? 0U : lane, 0, 0, 0, 0, false};
-    bool active = true;
-    while (active) {
-        active = false;
-        for (uint32_t p = 0; p < sender.Count(); ++p) {
-            auto& c = cursor[p];
-            const uint32_t peer = sender.Rank(p);
-            while (c.channel < td.num_channels && (!c.loaded || c.pos == c.end)) {
-                if (c.loaded) c.channel += step;
-                if (c.channel >= td.num_channels) break;
-                const uint32_t previous = c.channel ? channel_gm.GetValue(peer * td.num_channels + c.channel - 1) : 0;
-                const uint32_t count = channel_gm.GetValue(peer * td.num_channels + c.channel) - previous;
-                c.pos = 0; c.end = count; c.field = 0; c.loaded = true;
-                if (weighted) {
-                    const uint32_t total = channel_gm.GetValue(peer * td.num_channels + td.num_channels - 1);
-                    const uint32_t first = PeerRowBoundary(total, lane, td.udma_workers_per_peer,
-                        td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
-                    const uint32_t last = PeerRowBoundary(total, lane + 1, td.udma_workers_per_peer,
-                        td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
-                    const uint32_t skip = first > previous ? first - previous : 0;
-                    const uint32_t stop = last > previous ? last - previous : 0;
-                    c.pos = skip < count ? skip : count; c.end = stop < count ? stop : count;
+    for (uint32_t first = 0; first < sender.Count();) {
+        const uint32_t last = PeerWindowEnd(sender, td.rank, td.world_size, td.udma_ranks_per_group, td.udma_peer_order, first);
+        bool active = true;
+        while (active) {
+            active = false;
+            for (uint32_t p = first; p < last; ++p) {
+                auto& c = cursor[p];
+                const uint32_t peer = sender.Rank(p);
+                while (c.channel < td.num_channels && (!c.loaded || c.pos == c.end)) {
+                    if (c.loaded) c.channel += step;
+                    if (c.channel >= td.num_channels) break;
+                    const uint32_t previous = c.channel ? channel_gm.GetValue(peer * td.num_channels + c.channel - 1) : 0;
+                    const uint32_t count = channel_gm.GetValue(peer * td.num_channels + c.channel) - previous;
+                    c.pos = 0; c.end = count; c.field = 0; c.loaded = true;
+                    if (weighted) {
+                        const uint32_t total = channel_gm.GetValue(peer * td.num_channels + td.num_channels - 1);
+                        const uint32_t first = PeerRowBoundary(total, lane, td.udma_workers_per_peer,
+                            td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
+                        const uint32_t last = PeerRowBoundary(total, lane + 1, td.udma_workers_per_peer,
+                            td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
+                        const uint32_t skip = first > previous ? first - previous : 0;
+                        const uint32_t stop = last > previous ? last - previous : 0;
+                        c.pos = skip < count ? skip : count; c.end = stop < count ? stop : count;
+                    }
+                    c.row = (td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0) + previous + c.pos;
                 }
-                c.row = (td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0) + previous + c.pos;
-            }
-            if (c.channel >= td.num_channels) continue;
-            active = true;
-            sender.BeginVisit(p);
-            uint32_t visit = td.udma_wqes_per_visit;
-            while (visit && c.pos < c.end) {
-                const uint64_t index = (uint64_t(peer) * td.num_channels + c.channel) * plan_stride + c.pos;
-                const uint32_t available = (c.end - c.pos) * fields - c.field;
-                const uint32_t n = sender.PutRows(p, plan + index, c.row, c.field,
-                    available < visit ? available : visit, available);
-                const uint32_t rows = (c.field + n) / fields;
-                c.field = (c.field + n) % fields; c.pos += rows; c.row += rows; visit -= n;
+                if (c.channel >= td.num_channels) continue;
+                active = true;
+                sender.BeginVisit(p);
+                uint32_t visit = td.udma_wqes_per_visit;
+                while (visit && c.pos < c.end) {
+                    const uint64_t index = (uint64_t(peer) * td.num_channels + c.channel) * plan_stride + c.pos;
+                    const uint32_t available = (c.end - c.pos) * fields - c.field;
+                    const uint32_t n = sender.PutRows(p, plan + index, c.row, c.field,
+                        available < visit ? available : visit, available);
+                    const uint32_t rows = (c.field + n) / fields;
+                    c.field = (c.field + n) % fields; c.pos += rows; c.row += rows; visit -= n;
+                }
             }
         }
+        // Submit staging before moving windows; final Publish/Quiet still owns completion.
+        if (td.udma_peer_order == kGroupWindowOrder) sender.Flush();
+        first = last;
     }
 }
 
@@ -88,7 +94,7 @@ __aicore__ inline void DispatchRemoteImpl(
     const uint32_t fields = td.has_x_scales && scale_bytes ? 2U : 1U;
     const uint32_t lane = core % td.udma_workers_per_peer;
     const bool weighted = td.udma_cross_lane0_weight != 1;
-    if (td.dispatch_experiment_flags & kDispatchPeerCursor) {
+    if ((td.dispatch_experiment_flags & kDispatchPeerCursor) || td.udma_peer_order == kGroupWindowOrder) {
         profile.Add(profile.plan_ns, stage); stage = profile.Now();
         DispatchPeerCursors<Capacity>(sender, td, core, reinterpret_cast<const __gm__ int32_t*>(plan),
             rank_gm, channel_gm, plan_stride, fields);
@@ -210,11 +216,11 @@ __aicore__ inline void DispatchRemote(
     GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores, DispatchProfile& profile)
 {
     if (td.udma_qps_per_worker == 2) {
-        if (td.udma_peer_order == kGroupRoundRobinOrder)
+        if (GroupOwnerOrder(td.udma_peer_order))
             DispatchRemoteImpl<kGroupPeerCapacity, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, profile);
         else
             DispatchRemoteImpl<kMaxPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, profile);
-    } else if (td.udma_peer_order == kGroupRoundRobinOrder)
+    } else if (GroupOwnerOrder(td.udma_peer_order))
         DispatchRemoteImpl<kGroupPeerCapacity, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, profile);
     else
         DispatchRemoteImpl<kMaxPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, profile);
