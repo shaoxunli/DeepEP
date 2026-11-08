@@ -10,6 +10,44 @@ constexpr uint32_t kListsOffset = kDispatchSenderBytes;
 static_assert(kListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 1024);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 
+// Each producer owns one 512-byte local flag slot. Before Begin, zero is
+// drained by every core. After both SIMT outputs drain, producers publish one.
+template <class Resource>
+__aicore__ inline void StorePackedScaleReady(Resource& resource, const DispatchTilingData& td,
+    uint32_t core, uint64_t value)
+{
+    auto scratch = resource.template GetBufferByByte<uint64_t>(0);
+    scratch.SetValue(0, value);
+    AscendC::GlobalTensor<uint64_t> flag;
+    flag.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(td.packed_scale_ready + uint64_t(core) * 512U));
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID4);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID4);
+    AscendC::DataCopyExtParams copy{1, 8U, 0, 0, 0};
+    AscendC::DataCopyPad(flag, scratch, copy);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
+}
+
+__aicore__ inline void WaitPackedScaleReady(const DispatchTilingData& td, uint32_t core, uint32_t cores)
+{
+    const uint32_t first = MetadataFirst(td.world_size, td.udma_peers_per_worker, cores,
+        td.udma_peer_order, td.udma_ranks_per_group, td.udma_workers_per_peer);
+    const uint64_t started = static_cast<uint64_t>(AscendC::GetSystemCycle());
+    for (uint32_t producer = first; producer < cores; ++producer) {
+        auto* address = reinterpret_cast<__gm__ uint64_t*>(td.packed_scale_ready + uint64_t(producer) * 512U);
+        AscendC::GlobalTensor<uint64_t> flag;
+        flag.SetGlobalBuffer(address);
+        while (true) {
+            dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(address));
+            if (flag.GetValue(0) == 1U) break;
+            if (static_cast<uint64_t>(AscendC::GetSystemCycle()) - started >= kIncomingTimeoutCycles) {
+                AscendC::printf("[CLOS_SCALE_TIMEOUT] rank=%u core=%u producer=%u\n", td.rank, core, producer);
+                trap(); return;
+            }
+        }
+    }
+}
+
 // Independent peer cursors retain existing row ownership and completion.
 template <uint32_t Capacity, class Sender, class Prefix>
 __aicore__ inline void DispatchPeerCursors(Sender& sender, const DispatchTilingData& td, uint32_t core,
@@ -92,7 +130,7 @@ __aicore__ inline void DispatchRemoteImpl(
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
     const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
     const uint32_t fields = td.has_x_scales && scale_bytes &&
-                                   !(td.dispatch_experiment_flags & kDispatchSimtScales) ? 2U : 1U;
+                                   !(td.dispatch_experiment_flags & (kDispatchSimtScales | kDispatchPackedScales)) ? 2U : 1U;
     const uint32_t lane = core % td.udma_workers_per_peer;
     const bool weighted = td.udma_cross_lane0_weight != 1;
     if ((td.dispatch_experiment_flags & kDispatchPeerCursor) || td.udma_peer_order == kGroupWindowOrder) {
@@ -184,6 +222,32 @@ __aicore__ inline void DispatchRemoteImpl(
     }
     profile.Add(profile.plan_ns, stage);
     stage = profile.Now();
+    if (td.dispatch_experiment_flags & kDispatchPackedScales) {
+        if (td.packed_scale_ready && sender.Count()) {
+            sender.Flush(); // Release WQE scratch before the bulk-scale builder.
+            const uint64_t waited = profile.Now();
+            WaitPackedScaleReady(td, core, cores);
+            profile.Add(profile.scale_wait_ns, waited);
+        }
+        for (uint32_t p = 0; p < sender.Count(); ++p) {
+            const uint32_t peer = sender.Rank(p);
+            const uint32_t base = td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0;
+            if (weighted) {
+                const uint32_t total = channel_gm.GetValue(peer * td.num_channels + td.num_channels - 1);
+                const uint32_t first = PeerRowBoundary(total, lane, td.udma_workers_per_peer,
+                    td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
+                const uint32_t last = PeerRowBoundary(total, lane + 1U, td.udma_workers_per_peer,
+                    td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
+                sender.PutPackedScales(p, first, last - first, base);
+            } else {
+                for (uint32_t ch = lane; ch < td.num_channels; ch += td.udma_workers_per_peer) {
+                    const uint32_t first = ch ? channel_gm.GetValue(peer * td.num_channels + ch - 1) : 0;
+                    const uint32_t last = channel_gm.GetValue(peer * td.num_channels + ch);
+                    sender.PutPackedScales(p, first, last - first, base);
+                }
+            }
+        }
+    }
     sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
     profile.Add(profile.publish_ns, stage);
     stage = profile.Now();

@@ -8,6 +8,165 @@ import textwrap
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_packed_dispatch_scales_preserve_bits_and_peer_order(tmp_path):
+    """Execute the actual packing VF on CPU against an independently routed reference."""
+    import shutil
+    from tests.utils.cpp import cpp_functions
+
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    header = (ROOT / "csrc/clos/kernels/dispatch/dispatch_scale_pack.h").read_text()
+    method = cpp_functions(header, "PackDispatchPeerScalesVf", "PackV1DispatchScalesSimtVf")
+    source = tmp_path / "pack.cpp"
+    source.write_text(r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+#define __simt_vf__
+#define __launch_bounds__(n)
+#define __gm__
+constexpr unsigned kDispatchScalePackThreads=128;
+struct {unsigned x;} threadIdx;
+void asc_threadfence() {}
+namespace __asc_simt_vf {void __trap() {throw std::runtime_error("bounds");}}
+''' + method + r'''
+int main() {
+ for(unsigned tokens:{0,1,17,257}) for(unsigned scales:{1,22,56,129})
+ for(unsigned channels:{1,3,16}) for(unsigned cores:{1,8,16,32,48,64}) for(unsigned stride:{1,2}) for(unsigned column_major:{0,1}) {
+  const unsigned world=8,rank=2,ct=(tokens+channels-1)/channels,ps=(ct+7)/8*8;
+  const uint64_t ts=column_major ? 1U : uint64_t(scales)*stride+3;
+  const uint64_t ss=column_major ? tokens+3U : stride;
+  const uint64_t storage=tokens ? (tokens-1)*ts+(scales-1)*ss+1 : 0;
+  std::vector<uint32_t> input(storage,0xabcdef01),out(world*tokens*scales,0xdeadbeef),expected=out;
+  std::vector<int32_t> plan(world*channels*ps,-1),prefix(world*channels);
+  for(unsigned t=0;t<tokens;++t) for(unsigned s=0;s<scales;++s)
+   input[t*ts+s*ss]=0x80000000U^(t*65537U+s*17U); // Includes nonnumeric float bit patterns.
+  for(unsigned peer=0;peer<world;++peer) {
+   unsigned ordinal=0;
+   for(unsigned ch=0;ch<channels;++ch) {
+    unsigned local=0;
+    for(unsigned t=ch*ct;t<std::min(tokens,(ch+1)*ct);++t) {
+     if(peer==1 || (t+peer)%3) continue; // Completely empty peer and irregular tails.
+     plan[(peer*channels+ch)*ps+local++]=t;
+     if(peer!=rank) for(unsigned s=0;s<scales;++s)
+      expected[(peer*tokens+ordinal)*scales+s]=input[t*ts+s*ss];
+     ++ordinal;
+    }
+    prefix[peer*channels+ch]=ordinal;
+   }
+  }
+  for(unsigned core=0;core<cores;++core) for(threadIdx.x=0;threadIdx.x<128;++threadIdx.x)
+   PackDispatchPeerScalesVf(input.data(),out.data(),plan.data(),prefix.data(),rank,world,channels,ps,
+                           tokens,scales,ts,ss,core,cores);
+  assert(out==expected); // Also checks untouched self and unused capacity.
+  std::vector<uint32_t> normalized(tokens*scales,0xdeadbeef);
+  for(unsigned core=0;core<cores;++core) for(threadIdx.x=0;threadIdx.x<128;++threadIdx.x)
+   PackV1DispatchScalesSimtVf(input.data(),normalized.data(),tokens,scales,ts,ss,core,cores);
+  for(unsigned t=0;t<tokens;++t)for(unsigned col=0;col<scales;++col)
+   assert(normalized[t*scales+col]==input[t*ts+col*ss]);
+  if(!out.empty()) {out[0]^=1;assert(out!=expected);} // Reference check must detect corruption.
+ }
+}
+''')
+    binary = tmp_path / "pack"
+    subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
+def test_packed_scale_ready_waits_for_delayed_producers_and_reuse(tmp_path):
+    """Exercise actual local ready-store/wait helpers; NPU tests cover device visibility."""
+    import shutil
+    from tests.utils.cpp import cpp_functions
+
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    header = (ROOT / "csrc/clos/kernels/dispatch/udma_dispatch_schedule.h").read_text()
+    methods = cpp_functions(header, "StorePackedScaleReady", "WaitPackedScaleReady")
+    source = tmp_path / "ready.cpp"
+    source.write_text(r'''
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <cstdint>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+#define __aicore__
+#define __gm__
+constexpr int EVENT_ID4=4;
+constexpr uint64_t kIncomingTimeoutCycles=50000000;
+unsigned metadata_first=16;
+unsigned MetadataFirst(unsigned,unsigned,unsigned,unsigned,unsigned,unsigned){return metadata_first;}
+struct DispatchTilingData {
+ unsigned world_size=64,udma_peers_per_worker=1,udma_peer_order=4,udma_ranks_per_group=8,udma_workers_per_peer=2,rank=0;
+ uint64_t packed_scale_ready;
+};
+std::atomic<uint64_t> invalidations{0};
+void dcci_cacheline(uint8_t*){++invalidations;}
+void trap(){throw std::runtime_error("ready timeout");}
+namespace AscendC {
+ enum class HardEvent{S_MTE3,MTE3_S};
+ template<HardEvent> void SetFlag(int){}
+ template<HardEvent> void WaitFlag(int){}
+ struct DataCopyExtParams{unsigned count,bytes,a,b,c;};
+ template<class T>struct LocalTensor{T* p;void SetValue(unsigned i,T v){p[i]=v;}};
+ template<class T>struct GlobalTensor{
+  T* p;
+  void SetGlobalBuffer(T* q){p=q;}
+  T GetValue(unsigned i){return reinterpret_cast<std::atomic<T>*>(p+i)->load();}
+ };
+ template<class T>void DataCopyPad(GlobalTensor<T> out,LocalTensor<T> in,DataCopyExtParams copy){
+  assert(copy.count==1 && copy.bytes==8);
+  reinterpret_cast<std::atomic<T>*>(out.p)->store(in.p[0]);
+ }
+ uint64_t GetSystemCycle(){return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+ template<class... T>void printf(const char*,T...){}
+}
+struct Resource{uint64_t value=0;template<class T>AscendC::LocalTensor<T> GetBufferByByte(unsigned offset){assert(offset==0);return {reinterpret_cast<T*>(&value)};}};
+struct alignas(512) Slot{std::atomic<uint64_t> value{0};unsigned char padding[504]{};};
+static_assert(sizeof(Slot)==512);
+''' + methods + r'''
+int main(){
+ std::array<Slot,64> slots;
+ std::array<Resource,64> resources;
+ std::array<std::atomic<uint64_t>,64> produced{};
+ DispatchTilingData td;td.packed_scale_ready=reinterpret_cast<uint64_t>(slots.data());
+ for(unsigned first:{16,32}){
+  metadata_first=first;
+  for(unsigned round=1;round<=3;++round){
+   for(unsigned c=0;c<64;++c)StorePackedScaleReady(resources[c],td,c,0);
+   std::vector<std::thread> workers;
+   for(unsigned c=first;c<64;++c)workers.emplace_back([&,c,round]{
+    if(c==63)std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    produced[c].store(round+first*100);
+    StorePackedScaleReady(resources[c],td,c,1);
+   });
+   WaitPackedScaleReady(td,0,64);
+   // Check before joining: a stale flag or early return must fail.
+   for(unsigned c=first;c<64;++c)assert(produced[c].load()==round+first*100);
+   for(auto& w:workers)w.join();
+   for(unsigned c=0;c<64;++c){
+    assert(slots[c].value.load()==(c>=first));
+    for(auto byte:slots[c].padding)assert(byte==0);
+   }
+  }
+ }
+ StorePackedScaleReady(resources[63],td,63,0);
+ bool rejected=false;try{WaitPackedScaleReady(td,0,64);}catch(const std::runtime_error&){rejected=true;}
+ assert(rejected && invalidations.load()>0);
+}
+''')
+    binary = tmp_path / "ready"
+    subprocess.run([compiler, "-std=c++17", "-O2", "-pthread", str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True, timeout=10)
+
 DTYPES_ONLY = """
 import sys
 from types import ModuleType, SimpleNamespace
@@ -418,6 +577,7 @@ def test_dispatch_wqe_cache_matches_direct_sender(tmp_path):
         "PutRows",
         "Flush",
         "BeginVisit",
+        "PutPackedScales",
         "Credit",
         "Now",
         "PutCachedRows",
@@ -454,19 +614,29 @@ template<auto F, class... A> void asc_vf_call(dim3, A... a) {
 }
 constexpr unsigned kBatchWqes=32,kWqeBytes=64,kDispatchCacheEntries=8,kOutputRecordWords=8;
 constexpr unsigned kDispatchSimtScales=16;
+constexpr unsigned kDispatchPackedScales=32;
 constexpr unsigned kRequestsOffset=2048,kHeadersOffset=3072,EVENT_ID5=5;
 struct TD { unsigned hidden=7,x_element_bytes=2,num_scales=3,scale_element_bytes=4,
-    num_tokens=128,has_x_scales=0,dispatch_experiment_flags=0; };
+    num_tokens=128,has_x_scales=0,dispatch_experiment_flags=0;
+    uint64_t packed_peer_scales=0x50000000; };
 struct DispatchProfile {
     bool enabled=true,trace=true; uint64_t credit_checks=0,credit_stalls=0; uint64_t build_ns=0,submit_ns=0,credit_ns=0,wqes=0,batches=0,refills=0,hits=0;
+    uint64_t scale_submit_ns=0;
     uint64_t Now() {return 0;} uint64_t Elapsed() {return 0;} void Add(uint64_t&,uint64_t) {}
 };
 using Wqe=std::array<uint64_t,8>;
 template<unsigned Capacity,unsigned Qps> struct SenderT {
-    struct Peer { uint64_t state; }; Peer peers_[Capacity*Qps];
+    struct Peer { uint64_t state; unsigned peer; }; Peer peers_[Capacity*Qps];
     uint8_t* scratch_; unsigned count_=Capacity,qp_=0,last_=0,credits=0;
     uint64_t active_state_=0;
     std::vector<Wqe> sent;
+    unsigned pending_=0;
+    std::vector<std::array<uint64_t,4>> bulk;
+    void Flush() {
+        assert(pending_==1);
+        std::array<uint64_t,4> r;std::memcpy(r.data(),scratch_+kRequestsOffset,32);
+        bulk.push_back(r);pending_=0;
+    }
     unsigned QueuePeer(unsigned p) {return qp_*Capacity+p;}
     void SelectQp(unsigned q) {qp_=q;}
     bool EnsurePayloadCredit(unsigned) {
@@ -501,6 +671,7 @@ template<unsigned Capacity,unsigned Qps> struct TestSender:SenderT<Capacity,Qps>
         scratch_=arena;td_.has_x_scales=scales;
         for(unsigned p=0;p<Capacity*Qps;++p) {
             peers_[p].state=1+(p/Capacity)*3+(p%3); // Shared and distinct SQs.
+            peers_[p].peer=p%Capacity;
             for(unsigned last=0;last<2;++last) {
                 auto* h=reinterpret_cast<uint64_t*>(arena+kHeadersOffset+(p*2+last)*64);
                 for(unsigned w=0;w<5;++w) h[w]=p*100+w;
@@ -559,7 +730,32 @@ template<unsigned Qps> void check(bool cache,bool scales,unsigned visit,unsigned
     if(cache) assert(s.stats.refills>0);
     if(cache && peers==8 && Qps==1 && visit<32) assert(s.stats.hits>0);
 }
+template<unsigned Qps> void check_packed() {
+    TestSender<16,Qps> s(false,true);
+    s.td_.dispatch_experiment_flags=kDispatchPackedScales;
+    int32_t token=7;
+    for(unsigned p=0;p<16;++p) for(unsigned pass=0;pass<3;++pass) {
+        s.BeginVisit(p);
+        const unsigned q=s.QueuePeer(p),first=pass*5,count=17,base=41;
+        s.PutRows(p,&token,base+first,0,1,1); // Still pending when scale staging starts.
+        auto before=s.sent.size();
+        s.PutPackedScales(p,first,count,base);
+        assert(s.sent.size()==before+1 && s.bulk.size()==p*3+pass+1);
+        const auto r=s.bulk.back();
+        assert(r[0]==0x40000000ULL+q*65536+(base+first)*12);
+        assert(r[1]==0x50000000ULL+(p*128+first)*12 && r[2]==count*12 && r[3]==q);
+    }
+    const auto n=s.bulk.size();s.PutPackedScales(0,0,0,0);assert(s.bulk.size()==n);
+    bool rejected=false;try{s.PutPackedScales(0,120,17,0);}catch(const std::runtime_error&){rejected=true;}
+    assert(rejected);rejected=false;
+    try{s.PutPackedScales(0,0,17,9990);}catch(const std::runtime_error&){rejected=true;}
+    assert(rejected && s.stats.wqes==n*2);
+    uint64_t traced=0,batches=0;
+    for(const auto& t:s.trace_){traced+=t[6];batches+=t[7];}
+    assert(traced==n*2 && batches==n*2);
+}
 int main() {
+    check_packed<1>();check_packed<2>();
     for(bool cache:{false,true})for(bool scales:{false,true})for(unsigned v:{4,8,16,32})for(unsigned peers:{8,16}) {
         for(bool simt:{false,true}) {
             check<1>(cache,scales,v,peers,simt);check<2>(cache,scales,v,peers,simt);

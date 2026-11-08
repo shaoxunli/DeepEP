@@ -204,7 +204,7 @@ public:
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset), x_, scales_,
             td_.hidden * td_.x_element_bytes, td_.num_scales * td_.scale_element_bytes,
             td_.num_tokens, td_.has_x_scales && td_.num_scales && td_.scale_element_bytes &&
-                                    !(td_.dispatch_experiment_flags & kDispatchSimtScales) ? 2U : 1U, spans_,
+                                    !(td_.dispatch_experiment_flags & (kDispatchSimtScales | kDispatchPackedScales)) ? 2U : 1U, spans_,
             rows_pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
@@ -245,6 +245,40 @@ public:
             Flush();
             Base::SelectQp(next_qp_[p]);
             next_qp_[p] ^= 1U;
+        }
+    }
+
+    // Compact scale intervals use the same SQ and terminal SO as payload.
+    // Flush both request builders before their common UB scratch changes owner.
+    __aicore__ void PutPackedScales(uint32_t p, uint32_t first, uint32_t count, uint32_t rank_base)
+    {
+        if (!count) return;
+        Flush();
+        p = Base::QueuePeer(p);
+        const uint64_t bytes = uint64_t(td_.num_scales) * td_.scale_element_bytes;
+        const uint64_t row = uint64_t(rank_base) + first;
+        auto* output = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset) + p * kOutputRecordWords;
+        if (uint64_t(first) + count > td_.num_tokens || row + count > output[2] ||
+            uint64_t(count) * bytes > UINT32_MAX) { trap(); return; }
+        active_state_ = peers_[p].state;
+        Credit(p);
+        auto* request = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset);
+        request[0] = output[1] + row * bytes;
+        request[1] = td_.packed_peer_scales + (uint64_t(peers_[p].peer) * td_.num_tokens + first) * bytes;
+        request[2] = uint64_t(count) * bytes;
+        request[3] = p;
+        last_ = p;
+        Base::pending_ = 1;
+        const uint64_t submitted = Now();
+        Base::Flush();
+        if (Tracing()) {
+            const uint64_t at = profile_->Elapsed();
+            if (!trace_[p][7]) trace_[p][2] = at;
+            trace_[p][3] = at; ++trace_[p][6]; ++trace_[p][7];
+        }
+        if (profile_ && profile_->enabled) {
+            profile_->Add(profile_->scale_submit_ns, submitted);
+            ++profile_->wqes; ++profile_->batches;
         }
     }
 
@@ -313,7 +347,7 @@ private:
         uint32_t field, uint32_t count, uint32_t available)
     {
         const uint32_t fields = td_.has_x_scales && td_.num_scales && td_.scale_element_bytes &&
-                                       !(td_.dispatch_experiment_flags & kDispatchSimtScales) ? 2U : 1U;
+                                       !(td_.dispatch_experiment_flags & (kDispatchSimtScales | kDispatchPackedScales)) ? 2U : 1U;
         if (!count || available < count || field >= fields) { trap(); return 0; }
         const uint32_t slot = p % kDispatchCacheEntries;
         auto& entry = cache_[slot];

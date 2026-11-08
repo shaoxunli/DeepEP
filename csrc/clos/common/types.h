@@ -38,6 +38,7 @@ inline constexpr uint32_t kDispatchProfile = 2U;
 inline constexpr uint32_t kDispatchPeerCursor = 4U;
 inline constexpr uint32_t kDispatchTrace = 8U;
 inline constexpr uint32_t kDispatchSimtScales = 16U;
+inline constexpr uint32_t kDispatchPackedScales = 32U;
 inline constexpr uint32_t kDispatchProfileWords = 32U; // 256-byte private row per AIV.
 
 struct alignas(8) DispatchLayoutTilingData {
@@ -104,6 +105,8 @@ struct alignas(8) DispatchTilingData {
     // Buffer-owned symmetric address mailbox; never part of a cached handle.
     uint64_t udma_output_control;
     uint64_t udma_profile_output = 0; // Diagnostic-only ordinary GM, never SHMEM.
+    uint64_t packed_peer_scales = 0; // Private GM or reserved SHMEM staging; drained before reuse.
+    uint64_t packed_scale_ready = 0; // Optional local producer flags in unused self-peer staging.
 };
 
 struct alignas(8) CombineTilingData {

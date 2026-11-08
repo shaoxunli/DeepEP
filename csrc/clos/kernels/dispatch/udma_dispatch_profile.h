@@ -23,6 +23,7 @@ struct DispatchProfile {
     uint64_t build_ns = 0, credit_ns = 0, submit_ns = 0, publish_ns = 0;
     uint64_t incoming_ns = 0, quiet_ns = 0, barrier_ns = 0;
     uint64_t refills = 0, hits = 0, wqes = 0, batches = 0;
+    uint64_t scale_pack_ns = 0, scale_submit_ns = 0, scale_wait_ns = 0;
 
     __aicore__ uint64_t Now() const {
         return enabled ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0;
@@ -45,7 +46,9 @@ struct DispatchProfile {
         scratch.SetValue(18, local_sync_ns); scratch.SetValue(19, credit_checks);
         scratch.SetValue(20, credit_stalls);
         scratch.SetValue(21, send_records);
-        for (uint32_t i = 22; i < kDispatchProfileWords; ++i) scratch.SetValue(i, 0);
+        scratch.SetValue(22, scale_pack_ns); scratch.SetValue(23, scale_submit_ns);
+        scratch.SetValue(24, scale_wait_ns);
+        for (uint32_t i = 25; i < kDispatchProfileWords; ++i) scratch.SetValue(i, 0);
         AscendC::GlobalTensor<uint64_t> out;
         out.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(output) + uint64_t(core) * Stride());
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
