@@ -203,7 +203,8 @@ public:
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset), x_, scales_,
             td_.hidden * td_.x_element_bytes, td_.num_scales * td_.scale_element_bytes,
-            td_.num_tokens, td_.has_x_scales && td_.num_scales != 0 && td_.scale_element_bytes != 0 ? 2U : 1U, spans_,
+            td_.num_tokens, td_.has_x_scales && td_.num_scales && td_.scale_element_bytes &&
+                                    !(td_.dispatch_experiment_flags & kDispatchSimtScales) ? 2U : 1U, spans_,
             rows_pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
@@ -311,7 +312,8 @@ private:
     __aicore__ uint32_t PutCachedRows(uint32_t p, const __gm__ int32_t* indices, uint32_t row,
         uint32_t field, uint32_t count, uint32_t available)
     {
-        const uint32_t fields = td_.has_x_scales && td_.num_scales && td_.scale_element_bytes ? 2U : 1U;
+        const uint32_t fields = td_.has_x_scales && td_.num_scales && td_.scale_element_bytes &&
+                                       !(td_.dispatch_experiment_flags & kDispatchSimtScales) ? 2U : 1U;
         if (!count || available < count || field >= fields) { trap(); return 0; }
         const uint32_t slot = p % kDispatchCacheEntries;
         auto& entry = cache_[slot];

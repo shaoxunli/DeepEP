@@ -7,6 +7,38 @@
 namespace ascend_deepep::udma {
 constexpr uint32_t kDispatchMetadataSimtThreads = 128;
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+// Each metadata AIV owns whole channels; (peer, channel, ordinal, scale)
+// therefore has one writer. Preserve FP32/int32 scale bits without conversion.
+// Remote writes target symmetric staging, never an ordinary remote GM pointer.
+// The final dispatch collective completes these stores before local output copy.
+__simt_vf__ __launch_bounds__(kDispatchMetadataSimtThreads) inline void DispatchScalesVf(
+    const __gm__ uint32_t* scales, const __gm__ int32_t* plan, const __gm__ int32_t* ranks,
+    const __gm__ int32_t* channels, __gm__ uint8_t* workspace, uint64_t scale_offset,
+    uint32_t rank, uint32_t world, uint32_t channel_count, uint32_t channel, uint32_t stride,
+    uint32_t tokens, uint32_t num_scales)
+{
+    constexpr uint32_t lanes = 32;
+    for (uint32_t peer = 0; peer < world; ++peer) {
+        if (peer == rank) continue; // The existing MTE self-copy owns these rows.
+        const int32_t previous = channel ? channels[uint64_t(peer) * channel_count + channel - 1] : 0;
+        const int32_t count = channels[uint64_t(peer) * channel_count + channel] - previous;
+        const int32_t base = (rank ? ranks[uint64_t(rank - 1) * world + peer] : 0) + previous;
+        const uint64_t offset = (uint64_t(peer) * channel_count + channel) * stride;
+        for (uint32_t i = threadIdx.x / lanes; i < uint32_t(count); i += kDispatchMetadataSimtThreads / lanes) {
+            const int32_t token = plan[offset + i];
+            if (token < 0 || uint32_t(token) >= tokens) {
+                __asc_simt_vf::__trap();
+                return;
+            }
+            auto* dst = reinterpret_cast<__gm__ uint32_t*>(workspace + scale_offset) +
+                        (uint64_t(base) + i) * num_scales;
+            for (uint32_t scale = threadIdx.x % lanes; scale < num_scales; scale += lanes)
+                simt::aclshmem_uint32_p(dst + scale, scales[uint64_t(token) * num_scales + scale], peer);
+        }
+    }
+    asc_threadfence();
+}
+
 // Notify already chose the stable ordinal. Metadata workers only publish it.
 __simt_vf__ __launch_bounds__(kDispatchMetadataSimtThreads) inline void DispatchSourceIndicesVf(
     const __gm__ int32_t* plan, const __gm__ int32_t* ranks, const __gm__ int32_t* channels, __gm__ uint8_t* workspace,
@@ -151,7 +183,8 @@ __aicore__ inline void DispatchMetadata(
     x_gm.SetGlobalBuffer(x);
     scales_gm.SetGlobalBuffer(scales);
     output_x.SetGlobalBuffer(td.udma_output_control ? recv_x : workspace + td.x_buffer_offset);
-    output_scales.SetGlobalBuffer(td.udma_output_control ? recv_scales : workspace + td.x_scales_buffer_offset);
+    const bool simt_scales = td.dispatch_experiment_flags & kDispatchSimtScales;
+    output_scales.SetGlobalBuffer(td.udma_output_control && !simt_scales ? recv_scales : workspace + td.x_scales_buffer_offset);
     AscendC::DataCopyPadExtParams<uint8_t> pad{false, 0, 0, 0};
 
     const uint32_t x_bytes = td.hidden * td.x_element_bytes;
@@ -164,6 +197,15 @@ __aicore__ inline void DispatchMetadata(
         const uint64_t channel_begin = uint64_t(ch) * channel_tokens;
         const uint32_t begin = channel_begin < td.num_tokens ? uint32_t(channel_begin) : td.num_tokens;
         const uint32_t end = begin + channel_tokens < td.num_tokens ? begin + channel_tokens : td.num_tokens;
+        if (simt_scales) {
+            asc_vf_call<DispatchScalesVf>(
+                dim3(kDispatchMetadataSimtThreads), reinterpret_cast<const __gm__ uint32_t*>(scales),
+                reinterpret_cast<const __gm__ int32_t*>(plan), rank_ptr, channel_ptr, workspace,
+                td.x_scales_buffer_offset, td.rank, world, td.num_channels, ch, plan_stride,
+                td.num_tokens, td.num_scales);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        }
         if (build_handle) {
             asc_vf_call<DispatchSourceIndicesVf>(
                 dim3(kDispatchMetadataSimtThreads), reinterpret_cast<__gm__ int32_t*>(plan), rank_ptr, channel_ptr,

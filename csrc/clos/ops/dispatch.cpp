@@ -595,11 +595,17 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_WQE_CACHE") ? ascend_deepep::kDispatchWqeCache : 0U) |
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PROFILE") ? ascend_deepep::kDispatchProfile : 0U) |
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PEER_CURSOR") ? ascend_deepep::kDispatchPeerCursor : 0U) |
+        (x_scales.has_value() && num_scales && DispatchExperiment("DEEPEP_CLOS_DISPATCH_SIMT_SCALES")
+             ? ascend_deepep::kDispatchSimtScales
+             : 0U) |
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_TRACE")
              ? ascend_deepep::kDispatchTrace | ascend_deepep::kDispatchProfile
              : 0U);
     TORCH_CHECK(!tiling.dispatch_experiment_flags || (use_udma && !tiling.udma_token_schedule),
                 "Clos dispatch experiments require the UDMA peer schedule");
+    TORCH_CHECK(!(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchSimtScales) ||
+                    scale_element_bytes == sizeof(uint32_t),
+                "SIMT dispatch scales require 32-bit scale elements");
     TORCH_CHECK(!(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchProfile) || !capturing,
                 "Clos dispatch profiling performs a CPU readback and cannot be graph-captured");
     tiling.rank_stride = static_cast<uint32_t>(rank_stride);

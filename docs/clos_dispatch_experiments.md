@@ -192,6 +192,30 @@ device/API interval where available. A shorter communication kernel alone is
 not an end-to-end speedup, and this comparison changes receive placement as
 well as the memory mapping; it does not isolate page size alone.
 
+## SIMT scale transport
+
+`DEEPEP_CLOS_DISPATCH_SIMT_SCALES=1` opts into SIMT remote stores for dispatch
+scales. Default is `0`; set it consistently on every rank. It requires the UDMA
+peer schedule and 32-bit scale elements; calls without scales keep their normal path. FP32 and int32 scales
+are transferred bit for bit, using the existing input packing for strided
+scales. Payload remains on UDMA. The dispatch row scheduler and WQE cache omit
+the scale WQE when this switch is enabled.
+
+Metadata AIVs own complete logical channels and write scales to the existing
+symmetric receive region. Self rows retain the MTE copy. The existing final
+collective completes the SIMT writes before each AIV copies its disjoint valid
+scale rows to the returned tensor. No extra cross-rank collective or workspace
+allocation is added. The ordinary output tensor retains its own storage across
+subsequent calls. Zero-copy outputs already alias this region and need no copy.
+
+This changes both the transport and the scale receive placement. Compare the
+same binary with the switch off/on, keeping page size, payload placement,
+schedule, routing and shape fixed. The final scale copy is inside the dispatch
+communication kernel and must remain in its timing. Bandwidth includes the
+actual deduplicated payload and scale bytes, including self; it is not a pure
+SIMT-link bandwidth measurement. This experimental switch does not change
+combine or the default automatic policy.
+
 ## Manual cross-server lane weights
 
 `udma_cross_lane0_weight` accepts integer weights from 1 through 8. The default

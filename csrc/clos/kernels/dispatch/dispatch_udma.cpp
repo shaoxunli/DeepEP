@@ -197,19 +197,20 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
 
-    // Mailbox-enabled payload/scales are already in their final storage. Keep
-    // the internal staging baseline and the SIMT metadata materialization here.
+    // Mailbox-enabled payload is already in final storage. Experimental SIMT
+    // scales still use symmetric staging and are copied only after completion.
     if (!tiling.udma_output_control) {
         ascend_deepep::CopyDispatchRecvToGm(
             recv_x, symmetric_buffer, tiling.x_buffer_offset,
             static_cast<uint64_t>(recv_token_begin) * hidden_bytes,
             static_cast<uint64_t>(worker_tokens) * hidden_bytes, staging_pingpong_ub, staging_capacity);
-        if (tiling.has_x_scales != 0) {
-            ascend_deepep::CopyDispatchRecvToGm(
-                recv_x_scales, symmetric_buffer, tiling.x_scales_buffer_offset,
-                static_cast<uint64_t>(recv_token_begin) * scale_row_bytes,
-                static_cast<uint64_t>(worker_tokens) * scale_row_bytes, staging_pingpong_ub, staging_capacity);
-        }
+    }
+    if (tiling.has_x_scales &&
+        (!tiling.udma_output_control || (tiling.dispatch_experiment_flags & ascend_deepep::kDispatchSimtScales))) {
+        ascend_deepep::CopyDispatchRecvToGm(
+            recv_x_scales, symmetric_buffer, tiling.x_scales_buffer_offset,
+            static_cast<uint64_t>(recv_token_begin) * scale_row_bytes,
+            static_cast<uint64_t>(worker_tokens) * scale_row_bytes, staging_pingpong_ub, staging_capacity);
     }
     if (num_topk > 0) {
         ascend_deepep::CopyDispatchRecvToGm(

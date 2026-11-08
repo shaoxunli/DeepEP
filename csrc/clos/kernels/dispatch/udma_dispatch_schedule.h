@@ -91,7 +91,8 @@ __aicore__ inline void DispatchRemoteImpl(
     const uint32_t max_tile = 65536U / td.world_size < kTileTokens ? 65536U / td.world_size : kTileTokens;
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
     const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
-    const uint32_t fields = td.has_x_scales && scale_bytes ? 2U : 1U;
+    const uint32_t fields = td.has_x_scales && scale_bytes &&
+                                   !(td.dispatch_experiment_flags & kDispatchSimtScales) ? 2U : 1U;
     const uint32_t lane = core % td.udma_workers_per_peer;
     const bool weighted = td.udma_cross_lane0_weight != 1;
     if ((td.dispatch_experiment_flags & kDispatchPeerCursor) || td.udma_peer_order == kGroupWindowOrder) {

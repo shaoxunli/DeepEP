@@ -453,9 +453,10 @@ template<auto F, class... A> void asc_vf_call(dim3, A... a) {
     for (unsigned i=0;i<32;++i) {threadIdx.x=i;F(a...);}
 }
 constexpr unsigned kBatchWqes=32,kWqeBytes=64,kDispatchCacheEntries=8,kOutputRecordWords=8;
+constexpr unsigned kDispatchSimtScales=16;
 constexpr unsigned kRequestsOffset=2048,kHeadersOffset=3072,EVENT_ID5=5;
 struct TD { unsigned hidden=7,x_element_bytes=2,num_scales=3,scale_element_bytes=4,
-    num_tokens=128,has_x_scales=0; };
+    num_tokens=128,has_x_scales=0,dispatch_experiment_flags=0; };
 struct DispatchProfile {
     bool enabled=true,trace=true; uint64_t credit_checks=0,credit_stalls=0; uint64_t build_ns=0,submit_ns=0,credit_ns=0,wqes=0,batches=0,refills=0,hits=0;
     uint64_t Now() {return 0;} uint64_t Elapsed() {return 0;} void Add(uint64_t&,uint64_t) {}
@@ -512,9 +513,10 @@ template<unsigned Capacity,unsigned Qps> struct TestSender:SenderT<Capacity,Qps>
         + methods
         + r"""
 };
-template<unsigned Qps> void check(bool cache,bool scales,unsigned visit,unsigned peers) {
+template<unsigned Qps> void check(bool cache,bool scales,unsigned visit,unsigned peers,bool simt) {
     TestSender<16,Qps> s(cache,scales);
-    const unsigned fields=scales?2:1;
+    s.td_.dispatch_experiment_flags=simt?kDispatchSimtScales:0;
+    const unsigned fields=scales&&!simt?2:1;
     std::vector<Wqe> expected;
     for(unsigned epoch=0;epoch<3;++epoch) {
         int32_t tokens[16][47];unsigned cursor[16]{},field[16]{},total[16];
@@ -559,12 +561,110 @@ template<unsigned Qps> void check(bool cache,bool scales,unsigned visit,unsigned
 }
 int main() {
     for(bool cache:{false,true})for(bool scales:{false,true})for(unsigned v:{4,8,16,32})for(unsigned peers:{8,16}) {
-        check<1>(cache,scales,v,peers);check<2>(cache,scales,v,peers);
+        for(bool simt:{false,true}) {
+            check<1>(cache,scales,v,peers,simt);check<2>(cache,scales,v,peers,simt);
+        }
     }
 }
 """
     )
     binary = tmp_path / "cache"
+    subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
+def test_simt_dispatch_scales_preserve_bits_and_unique_rows(tmp_path):
+    """Execute the real VF against a checked symmetric-memory transport double."""
+    import shutil
+    from tests.utils.cpp import cpp_functions
+
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    vf = cpp_functions(
+        (ROOT / "csrc/clos/kernels/dispatch/udma_dispatch_metadata.h").read_text(),
+        "DispatchScalesVf",
+    )
+    source = tmp_path / "scales.cpp"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <vector>
+#include <array>
+#include <stdexcept>
+#define __simt_vf__
+#define __launch_bounds__(n)
+#define __gm__
+constexpr unsigned kDispatchMetadataSimtThreads=128;
+struct { unsigned x; } threadIdx;
+namespace __asc_simt_vf { void __trap() { throw std::runtime_error("invalid token"); } }
+void asc_threadfence() {}
+constexpr unsigned W=4,C=8,T=17,S=8;
+std::vector<uint32_t> local;
+std::array<std::vector<uint32_t>,W> output,expected,writes;
+namespace simt {
+void aclshmem_uint32_p(uint32_t* ptr,uint32_t value,unsigned peer) {
+    auto index=ptr-local.data();
+    assert(peer<W && index>=0 && unsigned(index)<output[peer].size());
+    assert(++writes[peer][index]==1);
+    output[peer][index]=value;
+}
+}
+"""
+        + vf
+        + r"""
+int main() {
+    for(unsigned width:{1,31,32,33,56,65}) for(unsigned epoch=0;epoch<3;++epoch) {
+        // Different source ranks and channel lengths, including empty channels.
+        std::array<std::vector<int32_t>,W> plans,channels;
+        int32_t ranks[W*W]{};
+        unsigned offset[W]{};
+        for(unsigned src=0;src<W;++src) {
+            plans[src].assign(W*C*S,-1);channels[src].resize(W*C);
+            for(unsigned dst=0;dst<W;++dst) {
+                unsigned count=0;
+                for(unsigned ch=0;ch<C;++ch) {
+                    unsigned n=0;
+                    for(unsigned token=ch*3;token<(ch+1)*3 && token<T;++token)
+                        if((token+src*3+dst*5+epoch)%5<2)
+                            plans[src][(dst*C+ch)*S+n++]=token;
+                    count+=n;channels[src][dst*C+ch]=count;
+                }
+                offset[dst]+=count;ranks[src*W+dst]=offset[dst];
+            }
+        }
+        const unsigned guard=8,capacity=W*T*width+guard*2;
+        local.assign(capacity,0);
+        for(unsigned dst=0;dst<W;++dst) {
+            output[dst].assign(capacity,0xDEADBEEF);
+            expected[dst]=output[dst];writes[dst].assign(capacity,0);
+        }
+        for(unsigned src=0;src<W;++src) {
+            std::vector<uint32_t> scales(T*width);
+            for(unsigned token=0;token<T;++token)for(unsigned s=0;s<width;++s)
+                scales[token*width+s]=0x7F800001U+src*0x10000+token*width+s+epoch;
+            // Independent token scan reference, without interpreting the send plan.
+            for(unsigned dst=0;dst<W;++dst) {
+                unsigned row=src?ranks[(src-1)*W+dst]:0;
+                for(unsigned token=0;token<T;++token)if((token+src*3+dst*5+epoch)%5<2) {
+                    if(src!=dst)for(unsigned s=0;s<width;++s)
+                        expected[dst][guard+row*width+s]=scales[token*width+s];
+                    ++row;
+                }
+            }
+            for(unsigned ch=0;ch<C;++ch)for(unsigned lane=0;lane<128;++lane) {
+                threadIdx.x=lane;
+                DispatchScalesVf(scales.data(),plans[src].data(),ranks,channels[src].data(),
+                    reinterpret_cast<uint8_t*>(local.data()),guard*4,src,W,C,ch,S,T,width);
+            }
+        }
+        assert(output==expected);
+    }
+}
+"""
+    )
+    binary = tmp_path / "scales"
     subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 

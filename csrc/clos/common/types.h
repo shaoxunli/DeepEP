@@ -37,6 +37,7 @@ inline constexpr uint32_t kDispatchWqeCache = 1U;
 inline constexpr uint32_t kDispatchProfile = 2U;
 inline constexpr uint32_t kDispatchPeerCursor = 4U;
 inline constexpr uint32_t kDispatchTrace = 8U;
+inline constexpr uint32_t kDispatchSimtScales = 16U;
 inline constexpr uint32_t kDispatchProfileWords = 32U; // 256-byte private row per AIV.
 
 struct alignas(8) DispatchLayoutTilingData {
