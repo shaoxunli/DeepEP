@@ -15,7 +15,7 @@ from .config import Config, _MAX_NUM_AIV
 from .event import EventHandle, EventOverlap
 from .expand import ExpandHandle
 from .resources import Handle, Slot, SlotState
-from .udma_policy import resolve_udma_policy, validate_manual_config
+from .udma_policy import detect_pod_hosts, _check_override, resolve_udma_policy, validate_manual_config
 
 
 _ORPHANED_NATIVE_RESOURCES: list[tuple[Any, ...]] = []
@@ -123,13 +123,18 @@ class Buffer:
             udma_qps_per_worker,
             rank=rank,
             operation_config=True,
+            host_ids=detect_pod_hosts(resolved_group, comm, resolved_num_ranks, udma_auto_policy, resolved_transport),
         )
         if self._udma_auto_policy is not None:
             udma_schedule = "peer"
-            udma_dispatch_peer_order = udma_combine_peer_order = "rank"
-            udma_ranks_per_group = udma_peers_per_group_per_worker = None
-            udma_workers_per_peer = self._udma_auto_policy.workers_per_peer
-            udma_qps_per_worker = self._udma_auto_policy.qps_per_worker
+            policy = self._udma_auto_policy
+            udma_dispatch_peer_order = udma_combine_peer_order = policy.peer_order
+            udma_ranks_per_group = policy.ranks_per_group or None
+            udma_peers_per_group_per_worker = policy.peers_per_worker if policy.shape_policy else None
+            udma_workers_per_peer, udma_qps_per_worker = policy.workers_per_peer, policy.qps_per_worker
+            if udma_cross_lane0_weight != 1:
+                _check_override("udma_cross_lane0_weight", udma_cross_lane0_weight, policy.cross_lane0_weight, rank)
+            udma_cross_lane0_weight = policy.cross_lane0_weight
         else:
             udma_workers_per_peer = 1 if udma_workers_per_peer is None else udma_workers_per_peer
             udma_qps_per_worker = 1 if udma_qps_per_worker is None else udma_qps_per_worker
@@ -180,12 +185,13 @@ class Buffer:
         if type(udma_cross_lane0_weight) is not int or not 1 <= udma_cross_lane0_weight <= 8:
             raise ValueError("udma_cross_lane0_weight must be an integer in [1, 8]")
         if udma_cross_lane0_weight != 1:
-            if udma_auto_policy or udma_workers_per_peer != 2 or udma_qps_per_worker != 1 or not udma_ranks_per_group:
-                raise ValueError(
-                    "weighted cross lanes require manual mode, two workers, one QP each and an explicit group size"
-                )
+            if udma_workers_per_peer != 2 or udma_qps_per_worker != 1 or not udma_ranks_per_group:
+                raise ValueError("weighted cross lanes require two workers, one QP each and an explicit group size")
             # Include the immutable split in bootstrap agreement and native construction.
             peer_options = peer_options[:5] + (udma_qps_per_worker, udma_cross_lane0_weight)
+        if self._udma_auto_policy is not None and self._udma_auto_policy.shape_policy:
+            # Native provisions all small-core group mappings once, before any call.
+            peer_options = peer_options[:5] + (udma_qps_per_worker, udma_cross_lane0_weight, True)
         self._udma_cross_lane0_weight = udma_cross_lane0_weight
         self._udma_dispatch_peer_order = udma_dispatch_peer_order
         self._udma_combine_peer_order = udma_combine_peer_order
@@ -522,7 +528,13 @@ class Buffer:
             if num_worst_tokens != self.group_size * capacity:
                 raise ValueError("fixed dispatch output requires num_worst_tokens == group_size * capacity")
         if self._udma_auto_policy is not None:
-            config = self._udma_auto_policy.resolve_config(config, Buffer.num_sms, rank=self.rank)
+            config = self._udma_auto_policy.resolve_config(
+                config,
+                Buffer.num_sms,
+                rank=self.rank,
+                payload_bytes=int(x_tensor.size(1)) * x_tensor.element_size(),
+                scale_bytes=0 if x_scales is None else int(x_scales.size(1)) * x_scales.element_size(),
+            )
         elif self.transport == "udma":
             validate_manual_config(
                 config, self.udma_schedule, self.udma_dispatch_peer_order, self.udma_combine_peer_order
@@ -692,7 +704,12 @@ class Buffer:
         allocation_stream_id = _get_allocation_stream_id(allocate_on_comm_stream)
         _validate_previous_event(previous_event)
         if self._udma_auto_policy is not None:
-            config = self._udma_auto_policy.resolve_config(config, Buffer.num_sms, rank=self.rank)
+            config = self._udma_auto_policy.resolve_config(
+                config,
+                Buffer.num_sms,
+                rank=self.rank,
+                payload_bytes=int(x.size(1)) * x.element_size(),
+            )
         elif self.transport == "udma":
             validate_manual_config(
                 config, self.udma_schedule, self.udma_dispatch_peer_order, self.udma_combine_peer_order

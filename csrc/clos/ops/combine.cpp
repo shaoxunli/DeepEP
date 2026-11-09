@@ -188,7 +188,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
 
     const int64_t resolved_num_aiv = ResolveNumAiv(num_aiv);
     const int64_t num_channels = resolved_num_aiv;
-    if (ascend_deepep::udma::GroupOwnerOrder(shmem.CombinePeerOrder()))
+    if (ascend_deepep::udma::GroupOwnerOrder(shmem.CombinePeerOrder()) && !shmem.AutoShapePolicy())
         udma_peers_per_worker = shmem.PeersPerGroupPerWorker();
     if (use_udma) {
         TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");

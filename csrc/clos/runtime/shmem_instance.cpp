@@ -90,7 +90,7 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
                              bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
-                             int64_t udma_qps_per_worker, int64_t udma_cross_lane0_weight)
+                             int64_t udma_qps_per_worker, int64_t udma_cross_lane0_weight, bool udma_auto_shape_policy)
     : rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),
@@ -143,6 +143,12 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
     if (udma_cross_lane0_weight != 1 && (workers_per_peer_ != 2 || qps_per_worker_ != 1 || ranks_per_group_ == 0))
         throw std::invalid_argument("weighted cross lanes require two workers, one QP each and an explicit group size");
     cross_lane0_weight_ = static_cast<uint32_t>(udma_cross_lane0_weight);
+    if (udma_auto_shape_policy && (world_size != 64 || ranks_per_group_ != 8 || !shared_jetty_ || token_schedule_ ||
+                                   dispatch_peer_order_ != ascend_deepep::udma::kGroupWindowOrder ||
+                                   combine_peer_order_ != ascend_deepep::udma::kGroupWindowOrder ||
+                                   workers_per_peer_ != 2 || qps_per_worker_ != 1))
+        throw std::invalid_argument("Automatic row policy requires the EP64 eight-rank POD peer schedule");
+    auto_shape_policy_ = udma_auto_shape_policy;
     const uint32_t qp_lanes = workers_per_peer_ * qps_per_worker_;
     if (qp_lanes != 1 &&
         (!ascend_deepep::udma::GroupOwnerOrder(dispatch_peer_order_) ||
@@ -375,12 +381,12 @@ void ShmemInstance::InitRuntime()
             if (shared_jetty_) {
                 std::vector<uint64_t> masks(world_size_);
                 for (int peer = 0; peer < world_size_; ++peer)
-                    masks[peer] = token_schedule_
-                                      ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
-                                      : ascend_deepep::udma::PeerMask(rank_, peer, world_size_, dispatch_peer_order_,
-                                                                      combine_peer_order_, ranks_per_group_,
-                                                                      peers_per_group_per_worker_,
-                                                                      workers_per_peer_ * qps_per_worker_);
+                    masks[peer] =
+                        token_schedule_
+                            ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
+                            : ascend_deepep::udma::PeerMask(
+                                  rank_, peer, world_size_, dispatch_peer_order_, combine_peer_order_, ranks_per_group_,
+                                  peers_per_group_per_worker_, workers_per_peer_ * qps_per_worker_, auto_shape_policy_);
                 ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(masks.data(), masks.size()));
             } else {
                 ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(nullptr, 0));

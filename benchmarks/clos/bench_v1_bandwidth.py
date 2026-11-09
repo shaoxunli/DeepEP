@@ -308,6 +308,15 @@ def worker(args):
             buffer.barrier()
 
         for op, fn in functions.items():
+            payload_bytes = args.hidden * (1 if args.dtype == "fp8" and "dispatch" in op else 2)
+            scale_bytes = ((args.hidden + 127) // 128) * 4 if args.dtype == "fp8" and "dispatch" in op else 0
+            effective = shared.effective_udma_config(
+                buffer, config, payload_bytes=payload_bytes, scale_bytes=scale_bytes
+            )
+            if rank == 0:
+                print(
+                    "EFFECTIVE_UDMA_OPERATION", json.dumps(dict(operator=op, **effective), sort_keys=True), flush=True
+                )
             dist.barrier()
             before_iteration = align_combine_ranks if op.startswith("combine") else None
             print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
@@ -363,6 +372,7 @@ def worker(args):
                 caller.append(elapsed)
                 del result
             operators[op] = dict(
+                effective_udma_config=effective,
                 profile=profile,
                 caller_us=caller,
                 bytes=byte_ledger(

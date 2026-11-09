@@ -128,8 +128,9 @@ or barrier. Same-server peers remain covered; only self is omitted. Dispatch
 uses independent peer cursors across channel boundaries. Combine retains its
 index windows, optional weights and aggregate-readiness waits. Final publication,
 incoming completion and quiet are unchanged. The window controls UDMA payload;
-separately issued SIMT weights retain their existing traversal. Automatic policy
-stays unchanged.
+separately issued SIMT weights retain their existing traversal. The EP64 POD automatic policy selects this window order after validating the
+physical rank grouping; see [automatic policy](machine_backends.md#全-clos-的默认调度与手动调优)
+for row-byte selection and fallbacks.
 
 Compare both orders with identical peers, workers, lane weights, visits, AIV
 count, input routes and byte/timing definitions. Window size counts servers;

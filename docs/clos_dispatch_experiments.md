@@ -220,9 +220,10 @@ combine or the default automatic policy.
 
 `udma_cross_lane0_weight` accepts integer weights from 1 through 8. The default
 remains 1; the manual bandwidth benchmark keeps its previous default of 3 and
-accepts the range through `--tuning-cross-lane0-weight`. Automatic policy is
-unchanged. A non-unit weight requires manual mode, two workers per peer, one
-QP per worker, and an explicit contiguous physical-server group size. All
+accepts the range through `--tuning-cross-lane0-weight`. Manual non-unit weights require two workers per peer, one QP per worker,
+and an explicit contiguous physical-server group size. The EP64 POD automatic
+policy selects weight 4 after validating eight contiguous ranks per host; other
+topologies retain weight 1. See the [policy contract](machine_backends.md#全-clos-的默认调度与手动调优). All
 ranks must agree on this immutable constructor setting during bootstrap.
 
 For a cross-server peer with `N` actual receive rows, lane 0 owns
@@ -233,3 +234,21 @@ completion markers. This changes row ownership between the two workers, not
 the output row order, payload bytes, QP allocation, workspace layout, or
 completion protocol. Compare effective configurations and verify cross-server
 precision; a single-server run cannot validate the non-unit cross-server split.
+
+
+## Automatic packed-scale selection
+
+The EP64 POD row-byte policy can enable the existing packed-scale overlap without
+setting experimental environment variables. It requires owned mailbox outputs,
+1 GiB-page workspace, at least 32 AIVs, one-byte payload with 32-bit scales,
+payload row width >= 4096 bytes and payload plus scale row width <= 8192 bytes.
+Before enabling it, the host checks peer staging capacity, isolated ready-flag
+capacity, absence of workspace-backed inputs, and graph/zero-copy restrictions.
+Unsupported calls use the original scale path. This does not enable WQE cache,
+peer cursor, receive-workspace copies or diagnostic profiling.
+
+Enabled manual scale switches take precedence over automatic selection and retain their
+existing validation. `udma_auto_policy=False` disables automatic packed scales.
+`CLOS_SCALE_PIPELINE` records `automatic`, `active`, producer count and AIV count
+when the pipeline is selected. Host row-byte policy affects visit only; the
+existing kernel producer publication, incoming completion and Quiet remain intact.

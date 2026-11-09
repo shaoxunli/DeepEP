@@ -329,7 +329,7 @@ def check_idle(text, first_device, ep_size):
             raise RuntimeError(f"NPU {device} is busy, unhealthy or cannot be verified; no job started")
 
 
-def effective_udma_config(buffer, config=None, *, num_aiv=None):
+def effective_udma_config(buffer, config=None, *, num_aiv=None, payload_bytes=None, scale_bytes=0):
     """Report resolved runtime values rather than caller defaults (V1 uses Config)."""
     result = {
         name: getattr(buffer, name)
@@ -348,7 +348,11 @@ def effective_udma_config(buffer, config=None, *, num_aiv=None):
     if policy is not None:
         if num_aiv is None:
             num_aiv = config.num_aiv if config is not None else 32
-        policy = policy.for_num_aiv(num_aiv)
+        policy = (
+            policy.for_num_aiv(num_aiv)
+            if payload_bytes is None
+            else policy.for_row_bytes(num_aiv, payload_bytes, scale_bytes)
+        )
     for name in ("udma_peers_per_worker", "udma_wqes_per_visit"):
         result[name] = (
             getattr(policy, name.removeprefix("udma_"))
@@ -356,6 +360,11 @@ def effective_udma_config(buffer, config=None, *, num_aiv=None):
             else getattr(buffer if config is None else config, name)
         )
     result["udma_auto_policy"] = buffer.udma_auto_policy is not None
+    if policy is not None and policy.shape_policy:
+        result["udma_peers_per_group_per_worker"] = policy.peers_per_worker
+    if payload_bytes is not None:
+        result["payload_row_bytes"] = payload_bytes
+        result["scale_row_bytes"] = scale_bytes
     return result
 
 
@@ -691,6 +700,15 @@ def _worker(args):
             buffer.runtime.barrier()
 
         for op, fn in functions.items():
+            payload_bytes = args.hidden * (1 if args.dtype == "fp8" and "dispatch" in op else 2)
+            scale_bytes = ((args.hidden + 127) // 128) * 4 if args.dtype == "fp8" and "dispatch" in op else 0
+            effective = effective_udma_config(
+                buffer, num_aiv=args.num_aiv, payload_bytes=payload_bytes, scale_bytes=scale_bytes
+            )
+            if rank == 0:
+                print(
+                    "EFFECTIVE_UDMA_OPERATION", json.dumps(dict(operator=op, **effective), sort_keys=True), flush=True
+                )
             dist.barrier()
             before_iteration = align_combine_ranks if op.startswith("combine") else None
             print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
@@ -746,6 +764,7 @@ def _worker(args):
                 caller.append(elapsed)
                 del result
             operators[op] = dict(
+                effective_udma_config=effective,
                 profile=profile,
                 caller_us=caller,
                 bytes=byte_ledger(

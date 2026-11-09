@@ -20,7 +20,8 @@ public:
                   bool v1_shared_jetty = false, bool v1_token_schedule = false, int64_t udma_dispatch_peer_order = 0,
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
-                  int64_t udma_qps_per_worker = 1, int64_t udma_cross_lane0_weight = 1);
+                  int64_t udma_qps_per_worker = 1, int64_t udma_cross_lane0_weight = 1,
+                  bool udma_auto_shape_policy = false);
 
     ~ShmemInstance();
 
@@ -49,6 +50,10 @@ public:
     bool TokenSchedule() const
     {
         return token_schedule_;
+    }
+    bool AutoShapePolicy() const
+    {
+        return auto_shape_policy_;
     }
     uint32_t DispatchPeerOrder() const
     {
@@ -98,6 +103,7 @@ private:
     bool use_1g_huge_pages_;
     bool shared_jetty_;
     bool token_schedule_;
+    bool auto_shape_policy_ = false;
     uint32_t dispatch_peer_order_ = 0;
     uint32_t combine_peer_order_ = 0;
     uint32_t ranks_per_group_ = 0;

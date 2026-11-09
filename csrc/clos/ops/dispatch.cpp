@@ -404,7 +404,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
 
     const int64_t resolved_num_aiv = ResolveNumAiv(num_aiv);
     const int64_t num_channels = resolved_num_aiv;
-    if (ascend_deepep::udma::GroupOwnerOrder(shmem.DispatchPeerOrder()))
+    if (ascend_deepep::udma::GroupOwnerOrder(shmem.DispatchPeerOrder()) && !shmem.AutoShapePolicy())
         udma_peers_per_worker = shmem.PeersPerGroupPerWorker();
     if (use_udma) {
         TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");
@@ -591,6 +591,37 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
+    // Automatic scale staging uses only the disjoint, unused receive-scale
+    // region of an owned-output huge-page workspace. Captures, aliases, small
+    // cores/rows and insufficient staging/flag capacity keep the original path.
+    const bool manual_scale_transport = DispatchExperiment("DEEPEP_CLOS_DISPATCH_SIMT_SCALES") ||
+                                        DispatchExperiment("DEEPEP_CLOS_DISPATCH_PACKED_SCALES");
+    bool auto_packed_scales =
+        shmem.AutoShapePolicy() && !manual_scale_transport && use_udma && x_scales.has_value() && num_scales &&
+        x_element_bytes == 1 && scale_element_bytes == sizeof(uint32_t) && hidden_bytes >= 4096 &&
+        hidden_bytes + scale_row_bytes <= 8192 && resolved_num_aiv >= 32 && !zero_copy && !recv_workspace &&
+        !capturing && dispatch_output_control && shmem.Use1gHugePages() && symmetric_buffer == shmem.WorkspacePtr();
+    if (auto_packed_scales) {
+        const auto base = reinterpret_cast<uintptr_t>(symmetric_buffer);
+        for (const auto& input :
+             {c10::optional<torch::Tensor>(x), x_scales, topk_idx, topk_weights, num_tokens_per_rank,
+              c10::optional<torch::Tensor>(is_token_in_rank), num_tokens_per_expert, cached_rank_prefix_matrix,
+              cached_channel_prefix_matrix, cached_dispatch_plan}) {
+            if (!input.has_value() || input->numel() == 0) continue;
+            const auto address = reinterpret_cast<uintptr_t>(input->data_ptr());
+            if (address >= base && address - base < symmetric_buffer_bytes) auto_packed_scales = false;
+        }
+        const int64_t peer_bytes = CheckedMulInt64(num_tokens, scale_row_bytes, "auto packed scale bytes");
+        const uint64_t self = base + dispatch_workspace.x_scales_buffer_offset + uint64_t(rank) * peer_bytes;
+        const uint64_t padding = (512U - self % 512U) % 512U;
+        const uint32_t first = ascend_deepep::udma::MetadataFirst(world_size, udma_peers_per_worker, resolved_num_aiv,
+                                                                  shmem.DispatchPeerOrder(), shmem.RanksPerGroup(),
+                                                                  shmem.WorkersPerPeer());
+        auto_packed_scales = auto_packed_scales && peer_bytes <= std::numeric_limits<uint32_t>::max() &&
+                             num_tokens <= recv_buffer_tokens / world_size && first && first < resolved_num_aiv &&
+                             padding <= uint64_t(peer_bytes) &&
+                             uint64_t(resolved_num_aiv) * 512U <= uint64_t(peer_bytes) - padding;
+    }
     tiling.dispatch_experiment_flags =
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_WQE_CACHE") ? ascend_deepep::kDispatchWqeCache : 0U) |
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PROFILE") ? ascend_deepep::kDispatchProfile : 0U) |
@@ -598,7 +629,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         (x_scales.has_value() && num_scales && DispatchExperiment("DEEPEP_CLOS_DISPATCH_SIMT_SCALES")
              ? ascend_deepep::kDispatchSimtScales
              : 0U) |
-        (x_scales.has_value() && num_scales && DispatchExperiment("DEEPEP_CLOS_DISPATCH_PACKED_SCALES")
+        (x_scales.has_value() && num_scales &&
+                 (auto_packed_scales || DispatchExperiment("DEEPEP_CLOS_DISPATCH_PACKED_SCALES"))
              ? ascend_deepep::kDispatchPackedScales
              : 0U) |
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_TRACE")
@@ -619,7 +651,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         const int64_t peer_bytes = CheckedMulInt64(num_tokens, scale_row_bytes, "packed peer scale bytes");
         TORCH_CHECK(peer_bytes <= std::numeric_limits<uint32_t>::max(), "Packed scale interval exceeds WQE size");
         const int64_t bytes = CheckedMulInt64(world_size, peer_bytes, "packed dispatch scale bytes");
-        if (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PACKED_SCALES_HUGE")) {
+        if (auto_packed_scales || DispatchExperiment("DEEPEP_CLOS_DISPATCH_PACKED_SCALES_HUGE")) {
             // With owned mailbox outputs, this symmetric receive-scale region
             // has no readers or writers. Reuse it only as immutable send staging;
             // output scales still go directly to independent returned tensors.
@@ -627,10 +659,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                             shmem.Use1gHugePages() && symmetric_buffer == shmem.WorkspacePtr(),
                         "Huge-page packed scales require owned mailbox outputs and the huge-page workspace");
             const auto base = reinterpret_cast<uintptr_t>(symmetric_buffer);
-            for (const auto& input : {c10::optional<torch::Tensor>(x), x_scales, topk_idx, topk_weights,
-                                     num_tokens_per_rank, c10::optional<torch::Tensor>(is_token_in_rank),
-                                     num_tokens_per_expert, cached_rank_prefix_matrix,
-                                     cached_channel_prefix_matrix, cached_dispatch_plan}) {
+            for (const auto& input :
+                 {c10::optional<torch::Tensor>(x), x_scales, topk_idx, topk_weights, num_tokens_per_rank,
+                  c10::optional<torch::Tensor>(is_token_in_rank), num_tokens_per_expert, cached_rank_prefix_matrix,
+                  cached_channel_prefix_matrix, cached_dispatch_plan}) {
                 if (!input.has_value() || input->numel() == 0) continue;
                 const auto address = reinterpret_cast<uintptr_t>(input->data_ptr());
                 TORCH_CHECK(address < base || address - base >= symmetric_buffer_bytes,
@@ -643,11 +675,12 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
             packed_peer_scales = allocator.Empty({bytes}, x.options().dtype(torch::kUInt8));
             tiling.packed_peer_scales = reinterpret_cast<uint64_t>(packed_peer_scales.data_ptr());
         }
-        if (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PACKED_SCALES_OVERLAP")) {
-            TORCH_CHECK(DispatchExperiment("DEEPEP_CLOS_DISPATCH_PACKED_SCALES_HUGE"),
+        if (auto_packed_scales || DispatchExperiment("DEEPEP_CLOS_DISPATCH_PACKED_SCALES_OVERLAP")) {
+            TORCH_CHECK(auto_packed_scales || DispatchExperiment("DEEPEP_CLOS_DISPATCH_PACKED_SCALES_HUGE"),
                         "Scale overlap requires owned outputs and huge-page packed staging");
             const uint32_t first = ascend_deepep::udma::MetadataFirst(world_size, udma_peers_per_worker,
-                resolved_num_aiv, shmem.DispatchPeerOrder(), shmem.RanksPerGroup(), shmem.WorkersPerPeer());
+                                                                      resolved_num_aiv, shmem.DispatchPeerOrder(),
+                                                                      shmem.RanksPerGroup(), shmem.WorkersPerPeer());
             // Self scales go directly to owned output. Its unused packed interval
             // can hold cache-isolated local flags; small/no-spare cases stay serial.
             const uint64_t self = tiling.packed_peer_scales + uint64_t(rank) * uint64_t(peer_bytes);
@@ -661,7 +694,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
             if (reported_overlap != active) {
                 std::ostringstream line;
                 line << "[CLOS_SCALE_PIPELINE] rank=" << rank << " active=" << active
-                     << " producers=" << (active ? resolved_num_aiv - first : 0)
+                     << " automatic=" << auto_packed_scales << " producers=" << (active ? resolved_num_aiv - first : 0)
                      << " tokens=" << num_tokens << " aiv=" << resolved_num_aiv << '\n';
                 const auto text = line.str();
                 TORCH_CHECK(::write(STDERR_FILENO, text.data(), text.size()) == static_cast<ssize_t>(text.size()),
@@ -815,10 +848,11 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         auto cpu_profile = profile_output.cpu();
         const auto* values = cpu_profile.data_ptr<int64_t>();
         constexpr const char* names[] = {
-            "begin_ns",      "metadata_ns",   "setup_ns",      "plan_ns",     "send_ns",      "build_ns",
-            "credit_ns",     "submit_ns",     "publish_ns",    "incoming_ns", "quiet_ns",     "barrier_ns",
-            "refills",       "hits",          "wqes",          "batches",     "origin_cycle", "remote_wait_ns",
-            "local_sync_ns", "credit_checks", "credit_stalls", "send_records", "scale_pack_ns", "scale_submit_ns", "scale_wait_ns"};
+            "begin_ns",      "metadata_ns",   "setup_ns",      "plan_ns",      "send_ns",       "build_ns",
+            "credit_ns",     "submit_ns",     "publish_ns",    "incoming_ns",  "quiet_ns",      "barrier_ns",
+            "refills",       "hits",          "wqes",          "batches",      "origin_cycle",  "remote_wait_ns",
+            "local_sync_ns", "credit_checks", "credit_stalls", "send_records", "scale_pack_ns", "scale_submit_ns",
+            "scale_wait_ns"};
         for (int64_t core = 0; core < resolved_num_aiv; ++core) {
             std::ostringstream line;
             line << "[CLOS_DISPATCH_PROFILE] rank=" << rank << " core=" << core << " cached=" << cached_mode

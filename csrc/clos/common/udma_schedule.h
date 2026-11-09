@@ -191,7 +191,8 @@ ASCEND_DEEPEP_SCHEDULE_FN uint32_t WorkerPeer(
 // schedule, so switching visit/group size after a drained call needs no reinit.
 ASCEND_DEEPEP_SCHEDULE_FN uint64_t PeerMask(
     uint32_t rank, uint32_t peer, uint32_t world, uint32_t dispatch_order = kRankOrder,
-    uint32_t combine_order = kRankOrder, uint32_t ranks_per_group = 0, uint32_t peers_per_group = 0, uint32_t workers_per_peer = 1)
+    uint32_t combine_order = kRankOrder, uint32_t ranks_per_group = 0, uint32_t peers_per_group = 0, uint32_t workers_per_peer = 1,
+    bool adaptive_group_peers = false)
 {
     if (rank == peer)
         return 0;
@@ -199,7 +200,7 @@ ASCEND_DEEPEP_SCHEDULE_FN uint64_t PeerMask(
     for (uint32_t peers = 1; peers <= kMaxPeers; peers *= 2) {
         for (uint32_t op = 0; op < 2; ++op) {
             const uint32_t order = op ? combine_order : dispatch_order;
-            const uint32_t count = GroupOwnerOrder(order) ? peers_per_group : peers;
+            const uint32_t count = GroupOwnerOrder(order) && !adaptive_group_peers ? peers_per_group : peers;
             if (Workers(world, count, order, ranks_per_group) * workers_per_peer <= kQpCount) {
                 for (uint32_t lane = 0; lane < workers_per_peer; ++lane) {
                     mask |= uint64_t{1} << (Owner(rank, peer, world, count, order, ranks_per_group) * workers_per_peer + lane);

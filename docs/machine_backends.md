@@ -116,7 +116,7 @@ POD 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `shmem_ip
 ## 全 Clos 的默认调度与手动调优
 
 V1/V2 在 UDMA 下默认 `udma_auto_policy=True`，fresh/cached dispatch 与 combine
-采用相同的 peer 调度参数。机型识别与此策略是两层逻辑：先选通信实现，再选 Clos 调度。
+保持 Buffer 初始化时确定的 peer/QP 归属，每次调用选择有效 visit。机型识别与此策略是两层逻辑：先选通信实现，再选 Clos 调度。
 
 | EP | peers/worker | workers/peer | QPs/worker | WQEs/visit | peer 顺序 |
 | --- | --- | --- | --- | --- | --- |
@@ -125,18 +125,40 @@ V1/V2 在 UDMA 下默认 `udma_auto_policy=True`，fresh/cached dispatch 与 com
 | 17–128 | 4 | 1 | 1 | 32 | rank |
 | 129–256 | 8 | 1 | 1 | 32 | rank |
 
+上表是通用回退策略。EP64 初始化时会在 EP 组内核对 Linux boot ID；仅当每台主机
+恰好对应连续 8 个 EP rank、共 8 台不同主机时，使用 `clos-pod-bytes-v1`：
+`group_window` 顺序、每组每 worker 负责 1 个 peer、每 peer 2 个 worker、每 worker
+1 个 QP、跨 server 两个发送 worker 的行数按 4:1 分配。正常 32/64 AIV 下为
+16 个 payload 发送核；其余核保留原有元数据/本地处理职责。
+
+每次 dispatch/combine 使用该次实际输入的 `hidden * element_size`；dispatch 另加
+每行 scale 字节数。总行字节数不超过 8192 用 visit=8，超过用 visit=4。
+例如 H2816 BF16 为 5632 字节、H7168 FP8 加 scale 为 7392 字节，都选 8；
+H7168 BF16 为 14336 字节，选 4。FP8 dispatch 后的 BF16 combine 按 BF16 输入重新选。
+这是已测行宽之间的经验规则，不代表所有中间 shape 的全局最优值。
+原有 shape 与容量校验保持不变；显式设置了 `ElasticBuffer.hidden` 后仍需输入匹配。
+
+该 POD 策略下，符合容量与所有权条件的 FP8 dispatch 自动使用已有的 scale
+打包流水：1 GiB 大页、独立输出、至少 32 AIV、payload 行宽至少 4096 字节且
+含 scale 不超过 8192 字节，并有足够的 staging/ready-flag 空间。不满足条件、
+图捕获、zero-copy 或 workspace 输入时保留原 scale 传输。手动模式仍需显式选择实验开关。
+自动策略不修改 kernel 的发送完成或输出就绪协议。
+
 后两档是在 32 个 QP 预算内的推广，不代表所有 EP、核数和路由均已有性能测量。
 策略不修改用户指定的核数：V1 通过 `Config(num_sms=...)`，V2 在 dispatch/combine
 传 `num_sms=...`。上表为初始策略；核数不足时，自动将 peers/worker 按 1、2、4、8
 逐档增加，直到 `ceil((EP-1)/peers_per_worker) * workers_per_peer` 不超过核数及 32-QP
-预算。workers/peer、QPs/worker 和 WQEs/visit 保持不变；核数仍须为合法正偶数。
+预算。POD 窗口策略用 `ceil(8/peers_per_worker) * 2` 计算发送核数。
+workers/peer、QPs/worker 保持不变；核数仍须为合法正偶数。
 例如 8 核下 EP4/8/16/32 的 peers/worker 分别为 1/2/2/4；EP128 的 20 核使用
 8 peers/worker、16 个发送 worker。P=8 仍放不下时在下发前报错，例如 EP32 的 2 核。
 
 QP 资源初始化已覆盖上述所有 peer 分组，无需为低核数重建 Buffer。每次调用从不可变的
 初始策略与核数推导有效策略，不改变其他 handle；V2 cached dispatch/combine 沿用
-handle 核数，因此得到同一策略。`buffer.udma_auto_policy` 返回初始策略，
-`.for_num_aiv(n)` 返回指定核数的有效策略；带宽报告记录后者，版本为 `clos-v2`。
+handle 核数，但 visit 由该次实际输入行宽决定。`buffer.udma_auto_policy` 返回初始策略，
+`.for_num_aiv(n)` 返回指定核数的归属策略；
+`.for_row_bytes(n, payload_bytes, scale_bytes=0)` 返回调用的完整策略。带宽报告的
+`operators[op].effective_udma_config` 记录实际行宽和 visit，不能用构造期配置代替。
 手动模式不做自动调整。这里的核数约束作用于通信、notify 及对应 expand/reduce；
 fresh dispatch 前的独立 layout 仍按专家数和设备能力选核，不受该参数限制。
 实验性的 aggregate pipeline 仍要求 32/64 核。

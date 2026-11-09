@@ -21,7 +21,8 @@ def test_packed_dispatch_scales_preserve_bits_and_peer_order(tmp_path):
     header = (ROOT / "csrc/clos/kernels/dispatch/dispatch_scale_pack.h").read_text()
     method = cpp_functions(header, "PackDispatchPeerScalesVf", "PackV1DispatchScalesSimtVf")
     source = tmp_path / "pack.cpp"
-    source.write_text(r'''
+    source.write_text(
+        r"""
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -34,7 +35,9 @@ constexpr unsigned kDispatchScalePackThreads=128;
 struct {unsigned x;} threadIdx;
 void asc_threadfence() {}
 namespace __asc_simt_vf {void __trap() {throw std::runtime_error("bounds");}}
-''' + method + r'''
+"""
+        + method
+        + r"""
 int main() {
  for(unsigned tokens:{0,1,17,257}) for(unsigned scales:{1,22,56,129})
  for(unsigned channels:{1,3,16}) for(unsigned cores:{1,8,16,32,48,64}) for(unsigned stride:{1,2}) for(unsigned column_major:{0,1}) {
@@ -72,7 +75,8 @@ int main() {
   if(!out.empty()) {out[0]^=1;assert(out!=expected);} // Reference check must detect corruption.
  }
 }
-''')
+"""
+    )
     binary = tmp_path / "pack"
     subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
@@ -89,7 +93,8 @@ def test_packed_scale_ready_waits_for_delayed_producers_and_reuse(tmp_path):
     header = (ROOT / "csrc/clos/kernels/dispatch/udma_dispatch_schedule.h").read_text()
     methods = cpp_functions(header, "StorePackedScaleReady", "WaitPackedScaleReady")
     source = tmp_path / "ready.cpp"
-    source.write_text(r'''
+    source.write_text(
+        r"""
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -132,7 +137,9 @@ namespace AscendC {
 struct Resource{uint64_t value=0;template<class T>AscendC::LocalTensor<T> GetBufferByByte(unsigned offset){assert(offset==0);return {reinterpret_cast<T*>(&value)};}};
 struct alignas(512) Slot{std::atomic<uint64_t> value{0};unsigned char padding[504]{};};
 static_assert(sizeof(Slot)==512);
-''' + methods + r'''
+"""
+        + methods
+        + r"""
 int main(){
  std::array<Slot,64> slots;
  std::array<Resource,64> resources;
@@ -162,10 +169,12 @@ int main(){
  bool rejected=false;try{WaitPackedScaleReady(td,0,64);}catch(const std::runtime_error&){rejected=true;}
  assert(rejected && invalidations.load()>0);
 }
-''')
+"""
+    )
     binary = tmp_path / "ready"
     subprocess.run([compiler, "-std=c++17", "-O2", "-pthread", str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=10)
+
 
 DTYPES_ONLY = """
 import sys
@@ -330,7 +339,7 @@ def test_v1_public_config_reaches_native_argument_conversion(operation):
         kwargs = {{'config': deep_ep.Config()}}
         if {operation!r} == 'combine': kwargs['handle'] = ()
         try:
-            getattr(Buffer, {operation!r})(obj, object(), **kwargs)
+            getattr(Buffer, {operation!r})(obj, SimpleNamespace(size=lambda _: 6144, element_size=lambda: 2), **kwargs)
         except Converted:
             pass
         else:
@@ -349,7 +358,8 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
         class ReadyForDevice(Exception): pass
         counts = []
         policy = resolve_udma_policy(True, 8, 'udma', None, None, None, None, None)
-        def resolve(count):
+        def resolve(count, payload_bytes, scale_bytes=0):
+            assert (payload_bytes, scale_bytes) == (12288, 0)
             counts.append(count)
             return policy.for_num_aiv(count)
         @contextmanager
@@ -361,7 +371,7 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
         m._get_allocation_stream_id = lambda _: 0
         m._try_record_event = lambda _: None
         m._use_stream_after_event = stop_before_device
-        x = SimpleNamespace(size=lambda dim: (129, 6144)[dim])
+        x = SimpleNamespace(size=lambda dim: (129, 6144)[dim], element_size=lambda: 2)
         topk = SimpleNamespace(size=lambda dim: (129, 8)[dim])
         handle = SimpleNamespace(num_sms=64, num_experts=256, num_max_tokens_per_rank=129,
             expert_alignment=1, do_expand=False, topk_idx=topk,
@@ -371,7 +381,7 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
             use_fp8_dispatch=False, num_max_tokens_per_rank=129, num_ranks=8, hidden=6144, num_topk=8,
             get_buffer_size_hint=lambda *a: 0, group=None, allow_hybrid_mode=True,
             num_bytes=1, num_device_aiv=64, get_theoretical_num_sms=no_estimate,
-            _udma_auto_policy=SimpleNamespace(for_num_aiv=resolve), transport='udma',
+            _udma_auto_policy=SimpleNamespace(for_row_bytes=resolve), transport='udma',
             _communication_stream=None, _unpack_bias=lambda _: (None, None),
             _udma_config=SimpleNamespace(udma_peers_per_worker=1, udma_wqes_per_visit=8))
         requested = {requested!r}
@@ -1025,7 +1035,7 @@ def test_window_order_coverage_ownership_and_qps(tmp_path):
 using namespace ascend_deepep::udma;
 int main() {
  for(unsigned world:{8,16,32,64,128,256,512}) for(unsigned rank=0;rank<world;++rank)
- for(unsigned peers:{1,2,4}) {
+ for(unsigned peers:{1,2,4,8}) {
   if(peers*(world/8)>64) continue;
   std::vector<unsigned> seen(world);
   for(unsigned owner=0;owner<Workers(world,peers,kGroupWindowOrder,8);++owner) {
@@ -1157,3 +1167,70 @@ int main() {
         [compiler, "-std=c++17", "-O2", "-I", str(ROOT / "csrc/clos"), str(source), "-o", str(binary)], check=True
     )
     subprocess.run([str(binary)], check=True)
+
+
+def test_auto_row_policy_topology_bytes_and_independent_handles():
+    run_host("""
+        from deep_ep.backends.clos.udma_policy import resolve_udma_policy, detect_pod_hosts
+        from deep_ep.backends.clos import buffer as b
+        from deep_ep import _card_adapter as card
+        hosts = [str(i // 8) for i in range(64)]
+        def policy(ids=hosts):
+            return resolve_udma_policy(True, 64, 'udma', None, None, None, None, None, host_ids=ids)
+        p = policy()
+        assert (p.version, p.peer_order, p.workers_per_peer, p.qps_per_worker, p.cross_lane0_weight) == (
+            'clos-pod-bytes-v1', 'group_window', 2, 1, 4)
+        for cores, peers in ((2, 8), (4, 4), (8, 2), (16, 1), (20, 1), (32, 1), (64, 1)):
+            for payload, scales, visit in ((5632,0,8), (7168,224,8), (8192,0,8), (8192,4,4), (14336,0,4)):
+                q = p.for_row_bytes(cores, payload, scales)
+                assert q.peers_per_worker == peers and q.send_workers <= cores
+                assert q.wqes_per_visit == visit
+                assert q.config(cores).num_aiv == cores
+        assert p.peers_per_worker == 1 and p.wqes_per_visit == 8
+        for ids in (None, ['same']*64, [str(i%8) for i in range(64)], hosts[:32], [None]*64):
+            fallback = policy(ids)
+            assert fallback.peer_order == 'rank'
+            assert fallback.for_row_bytes(32,5632).wqes_per_visit == 32
+        assert resolve_udma_policy(False,64,'udma','peer','group_window','group_window',8,1,
+            2,1,1,16,host_ids=hosts) is None
+        card.host_identity = lambda: 'physical-host'
+        b._bootstrap_all_gather = lambda *a: [(True,'udma',h) for h in hosts]
+        assert detect_pod_hosts(None,None,64,True,'udma') == hosts
+        b._bootstrap_all_gather = lambda *a: [(False,'udma',None)] + [(True,'udma',h) for h in hosts[1:]]
+        try: detect_pod_hosts(None,None,64,True,'udma')
+        except ValueError as e: assert 'agree' in str(e)
+        else: raise AssertionError('mixed collective modes must fail on all ranks')
+    """)
+
+
+def test_auto_group_qp_masks_cover_all_core_budgets(tmp_path):
+    import shutil
+
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    source = tmp_path / "auto_masks.cpp"
+    source.write_text(r"""
+#include "csrc/clos/common/udma_schedule.h"
+#include <cassert>
+using namespace ascend_deepep::udma;
+int main() {
+ for(unsigned r=0;r<64;++r) for(unsigned p=0;p<64;++p) {
+  auto mask=PeerMask(r,p,64,kGroupWindowOrder,kGroupWindowOrder,8,1,2,true);
+  assert(mask==PeerMask(p,r,64,kGroupWindowOrder,kGroupWindowOrder,8,1,2,true));
+  if(r==p) {assert(mask==0);continue;}
+  assert((mask&1) && mask<(1ULL<<32));
+  for(unsigned peers=1;peers<=8;peers*=2) for(unsigned lane=0;lane<2;++lane) {
+   auto owner=Owner(r,p,64,peers,kGroupWindowOrder,8)*2+lane;
+   assert(owner<Workers(64,peers,kGroupWindowOrder,8)*2);
+   assert(mask&(1ULL<<owner));
+  }
+  // Manual runtime retains precisely its original fixed group ownership.
+  auto manual=PeerMask(r,p,64,kGroupWindowOrder,kGroupWindowOrder,8,1,2);
+  assert((manual&mask)==manual);
+ }
+}
+""")
+    binary = tmp_path / "auto_masks"
+    subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(ROOT), str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30)

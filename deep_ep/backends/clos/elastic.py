@@ -29,7 +29,7 @@ from .config import (
 )
 from .dtypes import topk_idx_bytes, topk_idx_t
 from .event import EventHandle, EventOverlap
-from .udma_policy import resolve_udma_policy
+from .udma_policy import detect_pod_hosts, _check_override, resolve_udma_policy
 
 
 _ELASTIC_BUFFER_ALIGNMENT = 2 * 1024 * 1024
@@ -161,13 +161,18 @@ class ElasticBuffer:
             udma_peers_per_worker,
             udma_wqes_per_visit,
             rank=rank,
+            host_ids=detect_pod_hosts(resolved_group, None, num_ranks, udma_auto_policy, transport),
         )
         if self._udma_auto_policy is not None:
             udma_schedule = "peer"
-            udma_dispatch_peer_order = udma_combine_peer_order = "rank"
-            udma_ranks_per_group = udma_peers_per_group_per_worker = None
             policy = self._udma_auto_policy
+            udma_dispatch_peer_order = udma_combine_peer_order = policy.peer_order
+            udma_ranks_per_group = policy.ranks_per_group or None
+            udma_peers_per_group_per_worker = policy.peers_per_worker if policy.shape_policy else None
             udma_workers_per_peer, udma_qps_per_worker = policy.workers_per_peer, policy.qps_per_worker
+            if udma_cross_lane0_weight != 1:
+                _check_override("udma_cross_lane0_weight", udma_cross_lane0_weight, policy.cross_lane0_weight, rank)
+            udma_cross_lane0_weight = policy.cross_lane0_weight
             udma_peers_per_worker, udma_wqes_per_visit = policy.peers_per_worker, policy.wqes_per_visit
         else:
             udma_workers_per_peer = 1 if udma_workers_per_peer is None else udma_workers_per_peer
@@ -200,12 +205,13 @@ class ElasticBuffer:
         if type(udma_cross_lane0_weight) is not int or not 1 <= udma_cross_lane0_weight <= 8:
             raise ValueError("udma_cross_lane0_weight must be an integer in [1, 8]")
         if udma_cross_lane0_weight != 1:
-            if udma_auto_policy or udma_workers_per_peer != 2 or udma_qps_per_worker != 1 or not udma_ranks_per_group:
-                raise ValueError(
-                    "weighted cross lanes require manual mode, two workers, one QP each and an explicit group size"
-                )
+            if udma_workers_per_peer != 2 or udma_qps_per_worker != 1 or not udma_ranks_per_group:
+                raise ValueError("weighted cross lanes require two workers, one QP each and an explicit group size")
             # Include the immutable split in bootstrap agreement and native construction.
             peer_options = peer_options[:5] + (udma_qps_per_worker, udma_cross_lane0_weight)
+        if self._udma_auto_policy is not None and self._udma_auto_policy.shape_policy:
+            # Native provisions all small-core group mappings once, before any call.
+            peer_options = peer_options[:5] + (udma_qps_per_worker, udma_cross_lane0_weight, True)
         self._udma_cross_lane0_weight = udma_cross_lane0_weight
         self._udma_dispatch_peer_order = udma_dispatch_peer_order
         self._udma_combine_peer_order = udma_combine_peer_order
@@ -779,7 +785,15 @@ class ElasticBuffer:
                 f"{self.num_bytes}"
             )
         _validate_num_sms(resolved_num_sms, self.num_device_aiv)
-        policy = self._udma_auto_policy.for_num_aiv(resolved_num_sms) if self._udma_auto_policy is not None else None
+        policy = (
+            self._udma_auto_policy.for_row_bytes(
+                resolved_num_sms,
+                int(x_tensor.size(1)) * x_tensor.element_size(),
+                0 if x_scales is None else int(x_scales.size(1)) * x_scales.element_size(),
+            )
+            if self._udma_auto_policy is not None
+            else None
+        )
         _validate_bool("do_handle_copy", do_handle_copy)
         _validate_bool("do_cpu_sync", resolved_do_cpu_sync)
         if not cached_mode and self.num_max_tokens_per_rank == 0:
@@ -1025,7 +1039,14 @@ class ElasticBuffer:
             raise NotImplementedError("intranode V2 does not use RDMA QPs")
         resolved_num_sms = handle.num_sms if num_sms == 0 else num_sms
         _validate_num_sms(resolved_num_sms, self.num_device_aiv)
-        policy = self._udma_auto_policy.for_num_aiv(resolved_num_sms) if self._udma_auto_policy is not None else None
+        policy = (
+            self._udma_auto_policy.for_row_bytes(
+                resolved_num_sms,
+                int(x.size(1)) * x.element_size(),
+            )
+            if self._udma_auto_policy is not None
+            else None
+        )
         if resolved_num_sms != handle.num_sms:
             raise ValueError("combine num_sms must match dispatch EPHandle")
         bias_0, bias_1 = self._unpack_bias(bias)
