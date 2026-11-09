@@ -335,6 +335,11 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     };
     const bool coarse_profile = diagnostic_enabled("DEEPEP_CLOS_COMM_STAGE_PROFILE");
     const bool detailed_profile = diagnostic_enabled("DEEPEP_CLOS_COMBINE_PROFILE");
+    const bool notify_before_combine = diagnostic_enabled("DEEPEP_CLOS_COMBINE_PRE_NOTIFY");
+    if (notify_before_combine) {
+        TORCH_CHECK(use_udma && epilogue && !aggregate && !pipeline_chunk_tokens && !shmem.TokenSchedule(),
+                    "Pre-combine notify requires the ordinary V2 UDMA communication path");
+    }
     torch::Tensor profile_output;
     if (coarse_profile || detailed_profile) {
         TORCH_CHECK(c10_npu::currentStreamCaptureStatusMayInitCtx() == c10_npu::CaptureStatus::None,
@@ -393,6 +398,11 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         (void)pipeline_mapping;
         (void)pipeline_values;
         (void)pipeline_ready;
+        // Experimental entry alignment: all ranks launch the same AIV count.
+        // Queue directly before communication, with no host wait in between.
+        // Begin still resets payload flags and performs its own collective.
+        if (notify_before_combine && phase == CombinePhase::Communication)
+            LaunchElasticBarrierKernel(resolved_num_aiv, ffts_addr);
         LaunchV1CombineKernel(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix,
                               send_head, recv_x, recv_topk_weights, tiling, symmetric_buffer, ffts_addr, use_udma,
                               phase);

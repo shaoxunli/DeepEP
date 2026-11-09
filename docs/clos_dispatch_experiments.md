@@ -283,3 +283,18 @@ existing validation. `udma_auto_policy=False` disables automatic packed scales.
 `CLOS_SCALE_PIPELINE` records `automatic`, `active`, producer count and AIV count
 when the pipeline is selected. Host row-byte policy affects visit only; the
 existing kernel producer publication, incoming completion and Quiet remain intact.
+
+## Pre-combine notify control
+
+`DEEPEP_CLOS_COMBINE_PRE_NOTIFY=1` queues the existing pure-sync
+`cached_notify_combine_kernel` immediately before ordinary V2 UDMA combine
+communication, after host preparation. It uses the resolved combine AIV count
+on the same stream and does not synchronize the host between the two kernels.
+The switch defaults off, accepts only `0/1`, and must match across ranks.
+Token and aggregate-pipeline schedules are excluded. Combine's Begin flag reset
+and collective are retained; this experiment does not remove synchronization.
+
+Report notify and communication separately, and also compare their per-sample,
+same-rank sum and elapsed span before taking the maximum across ranks. A higher
+communication-only bandwidth may move waiting to notify rather than improve
+combined latency. Keep L2 flush and the outer sampling barrier unchanged.
