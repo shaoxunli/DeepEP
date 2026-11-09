@@ -359,6 +359,17 @@ tensor readback. Keep capture enabled for the sampled interval to defer printing
 Fine-grained timestamps add instrumentation overhead and do not represent a
 clean-production API latency measurement.
 
+`DEEPEP_CLOS_COMBINE_SAME_STREAM=1` is an opt-in isolation experiment. The
+caller must already be on the Buffer communication stream and must not supply
+`previous_event`; otherwise combine raises an error. This skips the input
+dependency event, redundant stream context and input wait. Input production
+must be ordered on the same stream or completed before entering the experiment.
+Output completion events, tensor lifetime tracking, epilogue dependencies and
+device collectives remain unchanged. Enter the communication-stream context
+outside the sampling loop, and validate weighted and unweighted results before
+interpreting performance. This is not a transparent replacement for normal
+cross-stream compute/communication overlap.
+
 The Clos benchmark now captures combine diagnostic log lines in host memory
 before warmup and emits them after profiler stop and device synchronization.
 The internal `_begin_combine_profile_log_capture`, `_append_combine_profile_log`,

@@ -1101,10 +1101,19 @@ class ElasticBuffer:
                 raise ValueError("self-send aggregate pipeline requires 32 AIV and EP <= 8")
         if profile_ticks is not None:
             profile_ticks["layout_ready_ns"] = time.time_ns()
-        dependency = previous_event or _try_record_event(None)
+        same_stream = os.environ.get("DEEPEP_CLOS_COMBINE_SAME_STREAM") == "1"
+        if same_stream:
+            if previous_event is not None or _current_npu_stream() != self._communication_stream:
+                raise ValueError("Same-stream combine requires the communication stream to be current and no previous_event")
+            dependency = None  # Input production is ordered on this same stream.
+        else:
+            dependency = previous_event or _try_record_event(None)
         if profile_ticks is not None:
             profile_ticks["event_ready_ns"] = time.time_ns()
-        with _use_stream_after_event(self._communication_stream, dependency, profile_ticks):
+        context = nullcontext() if same_stream else _use_stream_after_event(self._communication_stream, dependency, profile_ticks)
+        with context:
+            if same_stream and profile_ticks is not None:
+                profile_ticks["stream_enter_ns"] = profile_ticks["dependency_wait_ns"] = time.time_ns()
             combine_x, combine_topk_weights = x, topk_weights
             single_source_slots = (
                 getattr(handle, "_single_source_slots", None)
