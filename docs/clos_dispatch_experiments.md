@@ -335,6 +335,15 @@ Cross-rank attribution requires validated clock-offset bounds from matched
 signal publications and observations, and ambiguous last-rank sets must remain
 ambiguous. A local last-AIV identifier alone does not imply a slow AIV.
 
+Host records also contain `native_entry_ns`, taken at the beginning of
+`V1Combine` before stream tracking and native validation. It is not the entry
+to the Python API or the binding wrapper. A diagnostic harness can record
+`time.time_ns()` at barrier return and immediately before the public combine
+call, then join these records by rank and sample. On the Linux test hosts these
+and `system_clock` use the host real-time clock; compare only within one server
+and reject non-monotonic sample boundaries. Device-clock offsets do not by
+themselves establish host-clock alignment between servers.
+
 The Clos benchmark now captures combine diagnostic log lines in host memory
 before warmup and emits them after profiler stop and device synchronization.
 The internal `_begin_combine_profile_log_capture`, `_append_combine_profile_log`,

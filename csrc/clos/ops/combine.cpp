@@ -191,6 +191,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     std::function<void()> aggregate, c10::optional<torch::Tensor> pipeline_mapping,
     c10::optional<torch::Tensor> pipeline_values, int64_t pipeline_chunk_tokens)
 {
+    const char* arrival_env = std::getenv("DEEPEP_CLOS_COMBINE_ARRIVAL_PROFILE");
+    const bool arrival_requested = arrival_env && std::strcmp(arrival_env, "1") == 0;
+    const auto host_now_ns = []() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    const int64_t native_entry_ns = arrival_requested ? host_now_ns() : 0;
     StreamAllocator allocator(allocation_stream_id);
     allocator.Record({x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
                       expanded_x, single_source_slots});
@@ -273,12 +280,6 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     TORCH_CHECK(!skip_output_zero ||
                     (use_udma && epilogue && !aggregate && !pipeline_chunk_tokens && !shmem.TokenSchedule()),
                 "Skipping output zero requires the ordinary V2 UDMA communication/reduction path");
-    const char* arrival_env = std::getenv("DEEPEP_CLOS_COMBINE_ARRIVAL_PROFILE");
-    const bool arrival_requested = arrival_env && std::strcmp(arrival_env, "1") == 0;
-    const auto host_now_ns = []() {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-    };
     const int64_t allocation_begin_ns = arrival_requested ? host_now_ns() : 0;
     auto recv_x = skip_output_zero ? allocator.Empty({num_tokens, hidden}, x.options())
                                    : allocator.Zeros({num_tokens, hidden}, x.options());
@@ -476,6 +477,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
             if (arrival_profile) {
                 std::ostringstream host;
                 host << "[CLOS_COMBINE_HOST] rank=" << rank << " weighted=" << tiling.has_topk_weights
+                     << " native_entry_ns=" << native_entry_ns
                      << " allocation_begin_ns=" << allocation_begin_ns << " allocation_end_ns=" << allocation_end_ns
                      << " launch_begin_ns=" << launch_begin_ns << " launch_end_ns=" << launch_end_ns << '\n';
                 const auto message = host.str();
