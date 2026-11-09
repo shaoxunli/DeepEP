@@ -211,6 +211,18 @@ ASCEND_DEEPEP_SCHEDULE_FN uint64_t PeerMask(
     }
     return mask;
 }
+// Benchmark-only superset. Both endpoints reserve every channel used by the
+// existing peer schedules; this does not change SQ ownership in any launch.
+ASCEND_DEEPEP_SCHEDULE_FN uint64_t TuningPeerMask(uint32_t rank, uint32_t peer, uint32_t world)
+{
+    uint64_t mask = 0;
+    for (uint32_t order = kRankOrder; order <= kGroupWindowOrder; ++order)
+        for (uint32_t lanes = 1; lanes <= 2; ++lanes)
+            for (uint32_t count = 1; count <= 4; count *= 2)
+                mask |= PeerMask(rank, peer, world, order, order, 8,
+                                 GroupOwnerOrder(order) ? count : 0, lanes);
+    return mask;
+}
 } // namespace ascend_deepep::udma
 
 #undef ASCEND_DEEPEP_SCHEDULE_FN

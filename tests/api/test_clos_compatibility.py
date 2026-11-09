@@ -1234,3 +1234,35 @@ int main() {
     binary = tmp_path / "auto_masks"
     subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(ROOT), str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=30)
+
+
+def test_tuning_qp_union_covers_every_candidate(tmp_path):
+    import shutil
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    source = tmp_path / "tuning_masks.cpp"
+    source.write_text(r"""
+#include "csrc/clos/common/udma_schedule.h"
+#include <cassert>
+#include <initializer_list>
+using namespace ascend_deepep::udma;
+int main() {
+ for (unsigned ep : {64U,128U}) for(unsigned r=0;r<ep;r++) for(unsigned p=0;p<ep;p++) {
+  auto mask=TuningPeerMask(r,p,ep);
+  assert(mask==TuningPeerMask(p,r,ep)); assert((mask>>32)==0);
+  if(r==p) {assert(mask==0);continue;}
+  assert(mask&1);
+  for(unsigned order=0;order<=4;order++) for(unsigned lanes=1;lanes<=2;lanes++)
+   for(unsigned peers : {1U,2U,4U,8U}) {
+    if(GroupOwnerOrder(order)&&peers>4) continue;
+    if(Workers(ep,peers,order,8)*lanes>32) continue;
+    for(unsigned lane=0;lane<lanes;lane++)
+     assert(mask&(1ULL<<(Owner(r,p,ep,peers,order,8)*lanes+lane)));
+   }
+ }
+}
+""")
+    binary = tmp_path / "tuning_masks"
+    subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(ROOT), str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30)

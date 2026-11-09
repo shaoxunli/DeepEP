@@ -34,6 +34,8 @@ public:
     void Barrier();
     void WaitHandle(aclrtStream stream) const;
     void Synchronize(aclrtStream stream) const;
+    std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+                                       int64_t workers, int64_t qps, int64_t weight);
     void Destroy();
 
     uint64_t FftsAddr() const;
@@ -104,6 +106,7 @@ private:
     bool shared_jetty_;
     bool token_schedule_;
     bool auto_shape_policy_ = false;
+    bool tuning_session_ = false;
     uint32_t dispatch_peer_order_ = 0;
     uint32_t combine_peer_order_ = 0;
     uint32_t ranks_per_group_ = 0;

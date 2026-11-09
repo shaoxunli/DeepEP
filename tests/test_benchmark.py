@@ -39,6 +39,54 @@ from tests.utils.cases import Case
 from tests.utils.reference import dispatch
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_fast_sweep_plan_respects_resource_limits():
+    import runpy
+    sweep = runpy.run_path(str(ROOT / "benchmarks/clos/bench_fast_sweep.py"))
+    for ep in (64, 128):
+        rows = sweep["candidates"](ep, 32)
+        assert {r["order"] for r in rows} == set(sweep["ORDERS"])
+        assert len({r["id"] for r in rows}) == len(rows)
+        assert {(r["workers"], r["qps"]) for r in rows} == {(1, 1), (1, 2), (2, 1)}
+        assert all(r["payload_aivs"] <= 32 and r["payload_aivs"] * r["qps"] <= 32 for r in rows)
+        assert all(r["workers"] == 2 or r["weight"] == 1 for r in rows)
+        assert all(r["peers"] * (ep // 8) <= 64 for r in rows if r["order"] in sweep["ORDERS"][3:])
+
+
+def test_fast_sweep_control_preserves_bootstrap_types():
+    import runpy
+    sweep = runpy.run_path(str(ROOT / "benchmarks/clos/bench_fast_sweep.py"))
+    options = ((4096, "udma", True, "tcp://host:1234", None, 16384, "peer", (0, 0, 8)), 0, [])
+    store = {}
+    group = sweep["StoreGroup"](type("Store", (), {"set": lambda _, k, v: store.__setitem__(k, v),
+                                                "get": lambda _, k: store[k]})(), 0, 1)
+    assert group.gather(options) == [options]
+    group.agree({"shapes": [(8192, 2816), (16384, 7168)]})
+
+
+def test_fast_sweep_parser_rejects_missing_kernel(tmp_path):
+    import runpy
+    parse = runpy.run_path(str(ROOT / "benchmarks/clos/bench_fast_sweep.py"))["parse_capture"]
+    names = ["cached_notify_combine_kernel", "cached_notify_combine_kernel",
+             "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+    path = tmp_path / "kernel_details.csv"
+    rows = []
+    for call in range(9):  # four global guards + warmup + two samples + two case guards
+        for step, name in enumerate(names):
+            rows.append(dict(Name=name, **{"Start Time(us)": call*100+step*10, "Duration(us)": step+1}))
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    parsed = parse(tmp_path, "combine_unweighted", [{"id": "test"}], 1, 2)
+    assert parsed[0]["communication_samples_us"] == [3.0, 3.0]
+    assert parsed[0]["barrier_us"] == 1
+    assert parsed[0]["notify_us"] == 2 and parsed[0]["reduce_us"] == 4
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows[:-1])
+    with pytest.raises(RuntimeError, match="incomplete capture"):
+        parse(tmp_path, "combine_unweighted", [{"id": "test"}], 1, 2)
+
+
 METADATA = dict(
     backend="test-only",
     device="test-only",

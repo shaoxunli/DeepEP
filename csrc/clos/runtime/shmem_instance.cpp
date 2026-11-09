@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <exception>
 #include <limits>
@@ -200,6 +201,35 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
     if (data_op_engine_type_ <= 0 || (data_op_engine_type_ & ~kValidEngineMask) != 0) {
         throw std::invalid_argument("invalid CANN SHMEM data operation engine type");
     }
+    const char* tuning = std::getenv("DEEPEP_CLOS_TUNING_SESSION");
+    tuning_session_ = tuning && std::strcmp(tuning, "1") == 0;
+    if (tuning_session_ && (!shared_jetty_ || token_schedule_ || auto_shape_policy_ ||
+                            ranks_per_group_ != 8 || (world_size_ != 64 && world_size_ != 128)))
+        throw std::invalid_argument("Tuning session requires manual EP64/128 peer scheduling and eight-rank servers");
+}
+
+std::vector<int64_t> ShmemInstance::ConfigureTuning(
+    int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+    int64_t workers, int64_t qps, int64_t weight)
+{
+    if (!initialized_ || !tuning_session_)
+        throw std::runtime_error("configure_tuning requires an initialized DEEPEP_CLOS_TUNING_SESSION=1 buffer");
+    // Validate without allocating a second heap or acquiring the global runtime.
+    ShmemInstance candidate(rank_, world_size_, ip_port_, data_op_engine_type_, use_1g_huge_pages_,
+                            unique_id_, bootstrap_key_, true, false, dispatch_order, combine_order,
+                            8, group_peers, workers, qps, weight, false);
+    // The caller supplies one identical configuration on every rank. Drain all
+    // local streams and align ranks before changing which AIV owns each SQ.
+    ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeDevice());
+    Barrier();
+    dispatch_peer_order_ = candidate.dispatch_peer_order_;
+    combine_peer_order_ = candidate.combine_peer_order_;
+    peers_per_group_per_worker_ = candidate.peers_per_group_per_worker_;
+    workers_per_peer_ = candidate.workers_per_peer_;
+    qps_per_worker_ = candidate.qps_per_worker_;
+    cross_lane0_weight_ = candidate.cross_lane0_weight_;
+    return {dispatch_peer_order_, combine_peer_order_, peers_per_group_per_worker_,
+            workers_per_peer_, qps_per_worker_, cross_lane0_weight_};
 }
 
 ShmemInstance::~ShmemInstance()
@@ -381,8 +411,9 @@ void ShmemInstance::InitRuntime()
             if (shared_jetty_) {
                 std::vector<uint64_t> masks(world_size_);
                 for (int peer = 0; peer < world_size_; ++peer)
-                    masks[peer] =
-                        token_schedule_
+                    masks[peer] = tuning_session_
+                        ? ascend_deepep::udma::TuningPeerMask(rank_, peer, world_size_)
+                        : token_schedule_
                             ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
                             : ascend_deepep::udma::PeerMask(
                                   rank_, peer, world_size_, dispatch_peer_order_, combine_peer_order_, ranks_per_group_,

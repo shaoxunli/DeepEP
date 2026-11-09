@@ -42,6 +42,8 @@ public:
 
     bool IsInitialized() const;
     void Barrier();
+    std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+                                       int64_t workers, int64_t qps, int64_t weight);
     void Destroy();
     void AbortInitialization();
     std::vector<std::string> MteMappingErrors() const;
