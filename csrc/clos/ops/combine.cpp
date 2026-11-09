@@ -1,6 +1,7 @@
 #include "ops/combine.h"
 
 #include <cstdint>
+#include <chrono>
 #include <limits>
 #include <algorithm>
 #include <cstdlib>
@@ -238,6 +239,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     TORCH_CHECK(!skip_output_zero ||
                     (use_udma && epilogue && !aggregate && !pipeline_chunk_tokens && !shmem.TokenSchedule()),
                 "Skipping output zero requires the ordinary V2 UDMA communication/reduction path");
+    const char* arrival_env = std::getenv("DEEPEP_CLOS_COMBINE_ARRIVAL_PROFILE");
+    const bool arrival_requested = arrival_env && std::strcmp(arrival_env, "1") == 0;
+    const auto host_now_ns = []() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    const int64_t allocation_begin_ns = arrival_requested ? host_now_ns() : 0;
     auto recv_x = skip_output_zero ? allocator.Empty({num_tokens, hidden}, x.options())
                                    : allocator.Zeros({num_tokens, hidden}, x.options());
 
@@ -254,6 +262,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         recv_topk_weights = skip_output_zero ? allocator.Empty({num_tokens, num_topk}, topk_weights->options())
                                             : allocator.Zeros({num_tokens, num_topk}, topk_weights->options());
     }
+    const int64_t allocation_end_ns = arrival_requested ? host_now_ns() : 0;
     if (bias_0.has_value()) {
         TORCH_CHECK(bias_0->dim() == 2 && bias_0->size(0) == num_tokens && bias_0->size(1) == hidden,
                     "bias_0 must have shape [num_tokens, hidden]");
@@ -348,21 +357,26 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     };
     const bool coarse_profile = diagnostic_enabled("DEEPEP_CLOS_COMM_STAGE_PROFILE");
     const bool detailed_profile = diagnostic_enabled("DEEPEP_CLOS_COMBINE_PROFILE");
+    const bool arrival_profile = diagnostic_enabled("DEEPEP_CLOS_COMBINE_ARRIVAL_PROFILE");
+    TORCH_CHECK(!arrival_profile || (world_size == 64 && resolved_num_aiv == 32 && !detailed_profile),
+                "Combine arrival profiling requires EP64/AIV32 and excludes detailed profiling");
     const bool notify_before_combine = diagnostic_enabled("DEEPEP_CLOS_COMBINE_PRE_NOTIFY");
     if (notify_before_combine) {
         TORCH_CHECK(use_udma && epilogue && !aggregate && !pipeline_chunk_tokens && !shmem.TokenSchedule(),
                     "Pre-combine notify requires the ordinary V2 UDMA communication path");
     }
     torch::Tensor profile_output;
-    if (coarse_profile || detailed_profile) {
+    const uint32_t profile_words = arrival_profile ? ascend_deepep::kCombineArrivalProfileWords :
+                                                    ascend_deepep::kDispatchProfileWords;
+    if (coarse_profile || detailed_profile || arrival_profile) {
         TORCH_CHECK(c10_npu::currentStreamCaptureStatusMayInitCtx() == c10_npu::CaptureStatus::None,
                     "Combine profiling performs a CPU readback and cannot be graph-captured");
         TORCH_CHECK(use_udma && epilogue && !aggregate && !pipeline_chunk_tokens && !shmem.TokenSchedule(),
                     "Combine profiling requires the ordinary V2 UDMA communication path");
-        profile_output = allocator.Empty({resolved_num_aiv, ascend_deepep::kDispatchProfileWords},
+        profile_output = allocator.Empty({resolved_num_aiv, profile_words},
                                          x.options().dtype(torch::kInt64));
         tiling.udma_profile_output = reinterpret_cast<uint64_t>(profile_output.data_ptr());
-        tiling.udma_profile_detailed = detailed_profile && !coarse_profile;
+        tiling.udma_profile_detailed = arrival_profile ? 2U : uint32_t(detailed_profile && !coarse_profile);
     }
 
     c10::optional<torch::Tensor> pipeline_ready;
@@ -416,25 +430,42 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         // Begin still resets payload flags and performs its own collective.
         if (notify_before_combine && phase == CombinePhase::Communication)
             LaunchElasticBarrierKernel(resolved_num_aiv, ffts_addr);
+        const int64_t launch_begin_ns = arrival_profile ? host_now_ns() : 0;
         LaunchV1CombineKernel(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix,
                               send_head, recv_x, recv_topk_weights, tiling, symmetric_buffer, ffts_addr, use_udma,
                               phase);
+        const int64_t launch_end_ns = arrival_profile ? host_now_ns() : 0;
 
         if (profile_output.defined() && phase == CombinePhase::Communication) {
             const auto cpu = profile_output.cpu();
             const auto* values = cpu.data_ptr<int64_t>();
+            if (arrival_profile) {
+                std::ostringstream host;
+                host << "[CLOS_COMBINE_HOST] rank=" << rank << " weighted=" << tiling.has_topk_weights
+                     << " allocation_begin_ns=" << allocation_begin_ns << " allocation_end_ns=" << allocation_end_ns
+                     << " launch_begin_ns=" << launch_begin_ns << " launch_end_ns=" << launch_end_ns << '\n';
+                const auto message = host.str();
+                TORCH_CHECK(::write(STDERR_FILENO, message.data(), message.size()) == static_cast<ssize_t>(message.size()),
+                            "Failed to write Clos combine host record");
+            }
             constexpr const char* names[] = {
                 "begin_ns", "metadata_ns", "setup_ns", "plan_ns", "send_ns", "build_ns", "credit_ns",
                 "submit_ns", "publish_ns", "incoming_ns", "quiet_ns", "barrier_ns", "refills", "hits",
                 "wqes", "batches", "origin_cycle", "remote_wait_ns", "local_sync_ns", "credit_checks",
                 "credit_stalls", "send_records", "scale_pack_ns", "scale_submit_ns", "scale_wait_ns",
-                "self_ns", "output_ns", "total_ns"};
+                "self_ns", "output_ns", "total_ns", "kernel_entry_cycle", "begin_entry_cycle",
+                "reset_done_cycle", "sync_entry_cycle", "local_enter_cycle", "local_exit_cycle",
+                "generation_ready_cycle", "round0_send_cycle", "round0_wait_cycle", "round0_end_cycle",
+                "round0_source_plus1", "round1_send_cycle", "round1_wait_cycle", "round1_end_cycle",
+                "round1_source_plus1", "sync_exit_cycle", "sync_radix", "sync_phases", "sync_generation",
+                "arrival_reserved"};
             for (int64_t core = 0; core < resolved_num_aiv; ++core) {
                 std::ostringstream line;
                 line << "[CLOS_COMBINE_PROFILE] rank=" << rank << " core=" << core
                      << " weighted=" << tiling.has_topk_weights << " detailed=" << tiling.udma_profile_detailed;
-                for (uint32_t word = 0; word < sizeof(names) / sizeof(names[0]); ++word)
-                    line << ' ' << names[word] << '=' << values[core * ascend_deepep::kDispatchProfileWords + word];
+                const uint32_t named_words = arrival_profile ? sizeof(names) / sizeof(names[0]) : 28U;
+                for (uint32_t word = 0; word < named_words; ++word)
+                    line << ' ' << names[word] << '=' << values[core * profile_words + word];
                 const auto message = line.str() + '\n';
                 TORCH_CHECK(::write(STDERR_FILENO, message.data(), message.size()) == static_cast<ssize_t>(message.size()),
                             "Failed to write Clos combine profiling record");

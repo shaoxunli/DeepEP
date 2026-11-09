@@ -11,6 +11,8 @@ struct DispatchProfile {
     __aicore__ explicit DispatchProfile(bool active) : enabled(active) {}
     bool enabled;
     bool detailed = true;
+    bool arrival = false;
+    uint64_t arrival_ticks[20];
     uint64_t entry_cycle = 0, self_ns = 0, output_ns = 0, total_ns = 0;
     bool trace = false;
     uint32_t rank = 0, world = 0, cores = 0, markers = 0, qps = 0;
@@ -18,7 +20,8 @@ struct DispatchProfile {
     uint64_t credit_checks = 0, credit_stalls = 0, send_records = 0;
     uint64_t first_poll[kTraceMaxIncoming], ready_poll[kTraceMaxIncoming], poll_count[kTraceMaxIncoming];
     __aicore__ uint32_t Stride() const {
-        return trace ? DispatchTraceStride(world, cores, markers, qps) : kDispatchProfileWords;
+        return arrival ? kCombineArrivalProfileWords :
+            (trace ? DispatchTraceStride(world, cores, markers, qps) : kDispatchProfileWords);
     }
     __aicore__ uint64_t Elapsed() const { return Now() - origin_cycle; }
     uint64_t begin_ns = 0, metadata_ns = 0, setup_ns = 0, plan_ns = 0, send_ns = 0;
@@ -52,13 +55,15 @@ struct DispatchProfile {
         scratch.SetValue(24, scale_wait_ns);
         scratch.SetValue(25, self_ns); scratch.SetValue(26, output_ns);
         scratch.SetValue(27, total_ns);
-        for (uint32_t i = 28; i < kDispatchProfileWords; ++i) scratch.SetValue(i, 0);
+        const uint32_t words = arrival ? kCombineArrivalProfileWords : kDispatchProfileWords;
+        for (uint32_t i = 28; i < words; ++i) scratch.SetValue(i, 0);
+        if (arrival) for (uint32_t i = 0; i < 20; ++i) scratch.SetValue(28 + i, arrival_ticks[i]);
         AscendC::GlobalTensor<uint64_t> out;
         out.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(output) + uint64_t(core) * Stride());
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
         AscendC::DataCopyPad(out, scratch,
-            AscendC::DataCopyExtParams{1, kDispatchProfileWords * uint32_t(sizeof(uint64_t)), 0, 0, 0});
+            AscendC::DataCopyExtParams{1, words * uint32_t(sizeof(uint64_t)), 0, 0, 0});
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
         if (!trace) return;

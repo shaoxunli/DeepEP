@@ -67,6 +67,8 @@ __aicore__ inline void V1CombineUdmaImpl(
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, const ascend_deepep::CombineTilingData& tiling)
 {
+    const uint64_t arrival_entry = tiling.udma_profile_output && tiling.udma_profile_detailed == 2 ?
+        static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0;
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
     const int32_t rank = static_cast<int32_t>(tiling.rank);
     const int32_t world_size = static_cast<int32_t>(tiling.world_size);
@@ -110,7 +112,12 @@ __aicore__ inline void V1CombineUdmaImpl(
 
     ascend_deepep::udma::DispatchProfile profile{
         DoCommunication && Phase == 0 && tiling.udma_profile_output != 0};
-    profile.detailed = tiling.udma_profile_detailed != 0;
+    profile.detailed = tiling.udma_profile_detailed == 1;
+    profile.arrival = profile.enabled && tiling.udma_profile_detailed == 2;
+    if (profile.arrival) {
+        for (uint32_t i = 0; i < 20; ++i) profile.arrival_ticks[i] = 0;
+        profile.arrival_ticks[0] = arrival_entry;
+    }
     uint64_t profile_started = 0;
     if constexpr (DoCommunication && Phase == 1) {
         ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
@@ -153,9 +160,11 @@ __aicore__ inline void V1CombineUdmaImpl(
         if constexpr (Phase == 0) {
             profile.entry_cycle = profile.Now();
             profile_started = profile.entry_cycle;
+            if (profile.arrival) profile.arrival_ticks[1] = profile.entry_cycle;
             ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
                 core_idx, num_channels, resource.template GetBufferByByte<uint64_t>(0),
-                tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(num_channels) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
+                tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(num_channels) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker,
+                profile.arrival ? profile.arrival_ticks : nullptr);
         }
 
         profile.Add(profile.begin_ns, profile_started);

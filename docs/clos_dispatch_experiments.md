@@ -314,3 +314,23 @@ device span with identical routing and sampling. Test pre-combine notify both
 off and on: a notify collective can absorb arrival skew from output preparation.
 Use separate coarse diagnostic samples for Begin; their host readback changes
 execution pacing and must not be treated as uninstrumented performance samples.
+
+## Combine Begin arrival diagnostics
+
+`DEEPEP_CLOS_COMBINE_ARRIVAL_PROFILE=1` records per-AIV kernel entry, flag reset,
+local rendezvous, and both V4 dissemination rounds for ordinary EP64/AIV32 V2
+UDMA combine. It defaults off and excludes detailed profiling. The diagnostic
+barrier mirrors the pinned SDK V4 algorithm; it preserves signal slots,
+generations, publication order, and all local collectives. Re-audit this copy
+before using a different SDK barrier implementation. Radix 8 and two rounds
+are checked on device.
+
+Each AIV owns a 512-byte diagnostic output row; normal profiling retains its
+256-byte row. Readback and logging occur after communication and perturb host
+pacing, so keep these runs separate from uninstrumented bandwidth measurements.
+Host allocation and launch timestamps are also recorded. Compare host launch
+times only within one server. Device counters are comparable within one NPU;
+do not directly subtract counters from different NPUs or host/trace clocks.
+Cross-rank attribution requires validated clock-offset bounds from matched
+signal publications and observations, and ambiguous last-rank sets must remain
+ambiguous. A local last-AIV identifier alone does not imply a slow AIV.

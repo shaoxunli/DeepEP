@@ -2,6 +2,7 @@
 
 #include "kernel_operator.h"
 #include "shmem.h"
+#include "kernels/common/combine_begin_profile.h"
 #include "simt_api/device_sync_functions.h"
 #define ASCEND_DEEPEP_DEVICE_SCHEDULE
 #include "common/udma_schedule.h"
@@ -36,7 +37,7 @@ __aicore__ inline __gm__ uint64_t* Signal(GM_ADDR base, uint64_t offset, uint32_
 // Dispatch's pre-Begin scale packing/top-k initialization still needs notify.
 __aicore__ inline void Begin(
     GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t world, uint32_t core, uint32_t cores,
-    AscendC::LocalTensor<uint64_t> scratch, uint32_t marker_count = 1)
+    AscendC::LocalTensor<uint64_t> scratch, uint32_t marker_count = 1, uint64_t* arrival_ticks = nullptr)
 {
     if (marker_count > kQpCount) { trap(); return; }
     for (uint32_t source = core; source < world; source += cores) {
@@ -51,7 +52,12 @@ __aicore__ inline void Begin(
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
     }
-    aclshmemi_sync_npu_v4<true>(0);
+    if (arrival_ticks) {
+        arrival_ticks[2] = AscendC::GetSystemCycle();
+        ProfileCombineBeginSync<true>(0, arrival_ticks);
+    } else {
+        aclshmemi_sync_npu_v4<true>(0);
+    }
 }
 
 struct PeerQueue {

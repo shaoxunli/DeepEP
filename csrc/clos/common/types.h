@@ -41,6 +41,7 @@ inline constexpr uint32_t kDispatchSimtScales = 16U;
 inline constexpr uint32_t kDispatchPackedScales = 32U;
 inline constexpr uint32_t kDispatchStageOnly = 64U;
 inline constexpr uint32_t kDispatchProfileWords = 32U; // 256-byte private row per AIV.
+inline constexpr uint32_t kCombineArrivalProfileWords = 64U; // Diagnostic-only 512-byte row.
 
 struct alignas(8) DispatchLayoutTilingData {
     uint32_t rank;
