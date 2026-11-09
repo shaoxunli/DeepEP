@@ -6,13 +6,15 @@
 
 namespace ascend_deepep::udma {
 // Combine uses the request area for <=32 spans, each describing one contiguous
-// run of rows/fields. Index windows remain live until the spans are flushed.
+// run of rows/fields. Index storage remains live until the spans are flushed:
+// immutable GM routing indices, or UB windows owned by the pipeline callers.
 inline constexpr uint32_t kCombineBasesOffset = kSenderScratchBytes;
 inline constexpr uint32_t kCombineSenderBytes = kCombineBasesOffset + kMaxPeers * sizeof(uint64_t);
 static_assert(kCombineSenderBytes % 32 == 0);
 static_assert(kCombineSenderBytes + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 1024);
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+template <typename IndexPointer>
 __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqes(
     __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* spans, __ubuf__ uint64_t* headers, __ubuf__ uint64_t* remote_bases,
     uint64_t x, uint64_t weights, uint64_t x_offset, uint64_t weights_offset, uint32_t x_bytes, uint32_t weight_bytes,
@@ -32,7 +34,7 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqes(
         const uint32_t peer = static_cast<uint32_t>(span[2]);
         const uint32_t position = static_cast<uint32_t>(span[2] >> 32U) + i - begin;
         const uint32_t row = static_cast<uint32_t>(span[1]) + position / fields * row_step;
-        const int32_t token = reinterpret_cast<__ubuf__ int32_t*>(span[0])[position / fields * index_step];
+        const int32_t token = reinterpret_cast<IndexPointer>(span[0])[position / fields * index_step];
         if (token < 0 || static_cast<uint32_t>(token) >= token_capacity) {
             __asc_simt_vf::__trap();
             return;
@@ -68,7 +70,7 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqes(
     __asc_simt_vf::__trap();
 }
 
-template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1>
+template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1, typename IndexPointer = const __ubuf__ int32_t*>
 class CombineSenderT : public SenderT<Capacity, Qps> {
     using Base = SenderT<Capacity, Qps>;
     using Base::scratch_; using Base::count_; using Base::peers_; using Base::qp_;
@@ -100,7 +102,7 @@ public:
 
     // Returns the WQEs admitted, which can end in the middle of an x/weight pair.
     // The caller retains the remainder of this peer's visit budget across tiles.
-    __aicore__ uint32_t PutRows(uint32_t p, __ubuf__ int32_t* indices, uint32_t row, uint32_t field, uint32_t count)
+    __aicore__ uint32_t PutRows(uint32_t p, IndexPointer indices, uint32_t row, uint32_t field, uint32_t count)
     {
         p = Base::QueuePeer(p);
         if (rows_pending_ && active_state_ != peers_[p].state)
@@ -129,7 +131,7 @@ public:
     // visits and token ownership remain identical to the original scheduler.
     template <uint32_t Phase>
     __aicore__ uint32_t PutSelectedRows(
-        uint32_t p, __ubuf__ int32_t* indices, uint32_t row, uint32_t field, uint32_t count)
+        uint32_t p, IndexPointer indices, uint32_t row, uint32_t field, uint32_t count)
     {
         if constexpr (Phase == 0) {
             return PutRows(p, indices, row, field, count);
@@ -161,7 +163,7 @@ public:
         const uint64_t rank_slot = uint64_t(td_.rank) * td_.token_capacity;
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
-        asc_vf_call<BuildCombineWqes>(
+        asc_vf_call<BuildCombineWqes<IndexPointer>>(
             dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset),
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
