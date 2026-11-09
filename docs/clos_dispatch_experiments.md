@@ -334,3 +334,17 @@ do not directly subtract counters from different NPUs or host/trace clocks.
 Cross-rank attribution requires validated clock-offset bounds from matched
 signal publications and observations, and ambiguous last-rank sets must remain
 ambiguous. A local last-AIV identifier alone does not imply a slow AIV.
+
+The Clos benchmark now captures combine diagnostic log lines in host memory
+before warmup and emits them after profiler stop and device synchronization.
+The internal `_begin_combine_profile_log_capture`, `_append_combine_profile_log`,
+and `_end_combine_profile_log_capture` hooks must run on the same host thread;
+sample markers use the same buffer to preserve record order. Capture reserves
+64 MiB per host thread before sampling and rejects overflow rather than dropping
+records. Failed runs drain their partial records during unwinding. An older
+native module is rejected when diagnostics are requested, rather than silently
+logging inside samples. Direct diagnostic calls outside capture still log
+immediately. Dispatch diagnostic output is not covered by this combine capture.
+This changes output timing only: per-call CPU readback, string formatting,
+device timing points and synchronization remain unchanged. It is not a claim
+that instrumented measurements have become free of overhead.

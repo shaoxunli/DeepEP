@@ -680,3 +680,68 @@ def test_zero_logical_traffic_is_distinct_from_unmeasured_latency():
     result = measured_result(cfg, {"rank_samples_us": [[1], [2]]}, revision="a" * 40, metadata=METADATA)
     assert result["statistics"]["bandwidth_gbps"] == 0
     assert result["statistics"]["latency_mean_us"] == 2
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_combine_profile_logs_are_deferred_and_drained(monkeypatch, capsys, fail):
+    import importlib.util
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    spec = importlib.util.spec_from_file_location("test_clos_profiling", ROOT / "benchmarks/clos/profiling.py")
+    profiling = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(profiling)
+    events, records = [], []
+
+    def begin():
+        events.append("begin")
+        records.clear()
+
+    def end():
+        events.append("end")
+        return "".join(records)
+
+    monkeypatch.setitem(sys.modules, "deep_ep._clos_C", SimpleNamespace(
+        _begin_combine_profile_log_capture=begin,
+        _append_combine_profile_log=records.append,
+        _end_combine_profile_log_capture=end,
+    ))
+    monkeypatch.setenv("BENCH_COMM_DIAGNOSTICS", "arrival")
+
+    @profiling._defer_combine_profile_output
+    def sample():
+        profiling._append_sample_marker("sample=0")
+        records.append("rank=0 core=0\n")
+        assert capsys.readouterr().err == ""
+        events.append("sample")
+        if fail:
+            raise ValueError("sample failed")
+        events.extend(["profiler_stopped", "device_synced"])
+        raise profiling._ProfileComplete
+
+    with pytest.raises(ValueError if fail else profiling._ProfileComplete):
+        sample()
+    assert capsys.readouterr().err == "sample=0\nrank=0 core=0\n"
+    assert events == (["begin", "sample", "end"] if fail else
+                      ["begin", "sample", "profiler_stopped", "device_synced", "end"])
+
+
+def test_combine_diagnostics_reject_native_without_capture(monkeypatch):
+    import importlib.util
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "deep_ep._clos_C", SimpleNamespace())
+    monkeypatch.setenv("BENCH_COMM_DIAGNOSTICS", "arrival")
+    spec = importlib.util.spec_from_file_location("test_clos_profiling_old", ROOT / "benchmarks/clos/profiling.py")
+    profiling = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(profiling)
+    called = []
+    with pytest.raises(RuntimeError, match="Rebuild the Clos native module"):
+        profiling._defer_combine_profile_output(lambda: called.append(True))()
+    assert called == []
+    # Clean profiling must neither require a new native extension nor reserve
+    # a diagnostic host buffer.
+    monkeypatch.setenv("BENCH_COMM_DIAGNOSTICS", "off")
+    for key in ("DEEPEP_CLOS_COMM_STAGE_PROFILE", "DEEPEP_CLOS_COMBINE_PROFILE",
+                "DEEPEP_CLOS_COMBINE_ARRIVAL_PROFILE"):
+        monkeypatch.delenv(key, raising=False)
+    assert profiling._defer_combine_profile_output(lambda: 42)() == 42

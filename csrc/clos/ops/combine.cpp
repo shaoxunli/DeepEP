@@ -20,6 +20,10 @@
 
 namespace {
 
+constexpr std::size_t kMaxCombineProfileLogBytes = 64U * 1024U * 1024U;
+thread_local bool capture_combine_profile_log = false;
+thread_local std::string combine_profile_log;
+
 constexpr int64_t kMaxCombineAiv = ascend_deepep::platform::kMaxNumAiv;
 constexpr int64_t kMaxCombineTopk = 128;
 constexpr int64_t kCombineUbBytes = ascend_deepep::platform::kKernelUbBytes;
@@ -121,6 +125,36 @@ int64_t ResolveNumAiv(int64_t num_aiv)
 }  // namespace
 
 namespace ascend_deepep::ops {
+
+void BeginCombineProfileLogCapture()
+{
+    TORCH_CHECK(!capture_combine_profile_log, "Combine profile log capture cannot be nested");
+    combine_profile_log.clear();
+    // Allocate before warmup/sampling, not while a rank is preparing its launch.
+    combine_profile_log.reserve(kMaxCombineProfileLogBytes);
+    capture_combine_profile_log = true;
+}
+
+void AppendCombineProfileLog(const std::string& message)
+{
+    if (capture_combine_profile_log) {
+        TORCH_CHECK(message.size() <= kMaxCombineProfileLogBytes - combine_profile_log.size(),
+                    "Combine diagnostic log exceeded 64 MiB; reduce samples and drain between operators");
+        combine_profile_log.append(message);
+        return;
+    }
+    TORCH_CHECK(::write(STDERR_FILENO, message.data(), message.size()) == static_cast<ssize_t>(message.size()),
+                "Failed to write Clos combine profiling record");
+}
+
+std::string EndCombineProfileLogCapture()
+{
+    TORCH_CHECK(capture_combine_profile_log, "Combine profile log capture is not active on this thread");
+    capture_combine_profile_log = false;
+    std::string result;
+    result.swap(combine_profile_log);
+    return result;
+}
 
 CombineEpilogue::CombineEpilogue(std::function<CombineResult()> launch)
     : launch_(std::move(launch)),
@@ -445,8 +479,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
                      << " allocation_begin_ns=" << allocation_begin_ns << " allocation_end_ns=" << allocation_end_ns
                      << " launch_begin_ns=" << launch_begin_ns << " launch_end_ns=" << launch_end_ns << '\n';
                 const auto message = host.str();
-                TORCH_CHECK(::write(STDERR_FILENO, message.data(), message.size()) == static_cast<ssize_t>(message.size()),
-                            "Failed to write Clos combine host record");
+                AppendCombineProfileLog(message);
             }
             constexpr const char* names[] = {
                 "begin_ns", "metadata_ns", "setup_ns", "plan_ns", "send_ns", "build_ns", "credit_ns",
@@ -467,8 +500,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
                 for (uint32_t word = 0; word < named_words; ++word)
                     line << ' ' << names[word] << '=' << values[core * profile_words + word];
                 const auto message = line.str() + '\n';
-                TORCH_CHECK(::write(STDERR_FILENO, message.data(), message.size()) == static_cast<ssize_t>(message.size()),
-                            "Failed to write Clos combine profiling record");
+                AppendCombineProfileLog(message);
             }
         }
 

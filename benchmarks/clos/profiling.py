@@ -1,6 +1,8 @@
 """Shared profiler sampling for the Clos bandwidth entrypoints."""
 
 import os
+import sys
+from functools import wraps
 from typing import Any, Callable
 
 import torch_npu
@@ -8,6 +10,46 @@ import torch_npu
 
 class _ProfileComplete(Exception):
     pass
+
+
+def _defer_combine_profile_output(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        # BufferRuntime has already loaded this module. Do not initialize native
+        # libraries just to profile a Python-only callable.
+        native = sys.modules.get("deep_ep._clos_C")
+        diagnostic_keys = (
+            "DEEPEP_CLOS_COMM_STAGE_PROFILE", "DEEPEP_CLOS_COMBINE_PROFILE",
+            "DEEPEP_CLOS_COMBINE_ARRIVAL_PROFILE",
+        )
+        diagnostics = os.environ.get("BENCH_COMM_DIAGNOSTICS", "off") != "off" or any(
+            os.environ.get(key) == "1" for key in diagnostic_keys
+        )
+        available = native is not None and hasattr(native, "_begin_combine_profile_log_capture")
+        if diagnostics and not available:
+            raise RuntimeError("Rebuild the Clos native module for deferred diagnostic logs before profiling")
+        capture = diagnostics and available
+        if capture:
+            native._begin_combine_profile_log_capture()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            # Normal completion reaches here after prof.stop() and device sync.
+            # Also preserve partial records if sampling raises an exception.
+            if capture:
+                records = native._end_combine_profile_log_capture()
+                if records:
+                    # Keep each original line separate, as in native logging;
+                    # one large write could interleave ranks inside a record.
+                    for line in records.splitlines(keepends=True):
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
+    return run
+
+
+def _append_sample_marker(message):
+    # Markers and native records share one buffer to retain their ordering.
+    sys.modules["deep_ep._clos_C"]._append_combine_profile_log(message + "\n")
 
 
 def _consume_profile_result(result: Any) -> None:
@@ -18,6 +60,7 @@ def _consume_profile_result(result: Any) -> None:
         event.current_stream_wait(release_handle=True)
 
 
+@_defer_combine_profile_output
 def _profile_operator(
     rank: int,
     args,

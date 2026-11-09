@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <string>
 #include <torch/custom_class.h>
 #include <tuple>
 
@@ -13,6 +14,11 @@ class BufferRuntime;
 }
 
 namespace ascend_deepep::ops {
+
+// Internal, same-host-thread diagnostic capture. Does not defer device readback.
+void BeginCombineProfileLogCapture();
+void AppendCombineProfileLog(const std::string& message);
+std::string EndCombineProfileLogCapture();
 
 using CombineResult = std::tuple<torch::Tensor, c10::optional<torch::Tensor>>;
 
