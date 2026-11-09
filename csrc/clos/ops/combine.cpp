@@ -227,7 +227,19 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     TORCH_CHECK(AlignUpInt64(hidden_bytes, kCombineAlignmentBytes) <= communication_ub_bytes,
                 "one combine token row requires ", hidden_bytes,
                 " bytes plus alignment, but the combine staging area provides ", communication_ub_bytes, " bytes");
-    auto recv_x = allocator.Zeros({num_tokens, hidden}, x.options());
+    // Opt-in A/B: the ordinary V2 UDMA reduction owns disjoint token ranges
+    // and overwrites every output element, including tokens with no contributors.
+    // This does not skip SHMEM flag resets or UB accumulator initialization.
+    const char* skip_zero_env = std::getenv("DEEPEP_CLOS_COMBINE_SKIP_OUTPUT_ZERO");
+    TORCH_CHECK(!skip_zero_env || !*skip_zero_env || std::strcmp(skip_zero_env, "0") == 0 ||
+                    std::strcmp(skip_zero_env, "1") == 0,
+                "DEEPEP_CLOS_COMBINE_SKIP_OUTPUT_ZERO must be 0 or 1");
+    const bool skip_output_zero = skip_zero_env && std::strcmp(skip_zero_env, "1") == 0;
+    TORCH_CHECK(!skip_output_zero ||
+                    (use_udma && epilogue && !aggregate && !pipeline_chunk_tokens && !shmem.TokenSchedule()),
+                "Skipping output zero requires the ordinary V2 UDMA communication/reduction path");
+    auto recv_x = skip_output_zero ? allocator.Empty({num_tokens, hidden}, x.options())
+                                   : allocator.Zeros({num_tokens, hidden}, x.options());
 
     c10::optional<torch::Tensor> recv_topk_weights = c10::nullopt;
     int64_t num_topk = 0;
@@ -239,7 +251,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         TORCH_CHECK(num_topk > 0, "topk_weights second dim must be greater than zero");
         TORCH_CHECK(num_topk <= kMaxCombineTopk, "num_topk must not exceed ", kMaxCombineTopk,
                     " for the combine UB layout");
-        recv_topk_weights = allocator.Zeros({num_tokens, num_topk}, topk_weights->options());
+        recv_topk_weights = skip_output_zero ? allocator.Empty({num_tokens, num_topk}, topk_weights->options())
+                                            : allocator.Zeros({num_tokens, num_topk}, topk_weights->options());
     }
     if (bias_0.has_value()) {
         TORCH_CHECK(bias_0->dim() == 2 && bias_0->size(0) == num_tokens && bias_0->size(1) == hidden,

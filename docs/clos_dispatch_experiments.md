@@ -298,3 +298,19 @@ Report notify and communication separately, and also compare their per-sample,
 same-rank sum and elapsed span before taking the maximum across ranks. A higher
 communication-only bandwidth may move waiting to notify rather than improve
 combined latency. Keep L2 flush and the outer sampling barrier unchanged.
+
+## Combine output initialization control
+
+`DEEPEP_CLOS_COMBINE_SKIP_OUTPUT_ZERO=1` allocates ordinary V2 UDMA combine
+payload and returned-weight outputs with `Empty` instead of `Zeros`. The
+reduction kernel owns disjoint token ranges and overwrites every output element,
+including zero-contributor tokens. This switch does not change SHMEM flag resets,
+UB accumulator initialization, stream recording, or completion synchronization.
+It defaults off, accepts only `0/1`, and must match across ranks. Token schedules,
+early aggregate, aggregate pipelines, and non-UDMA paths are excluded.
+
+Compare output-zero kernel duration, Begin waiting, communication, and the full
+device span with identical routing and sampling. Test pre-combine notify both
+off and on: a notify collective can absorb arrival skew from output preparation.
+Use separate coarse diagnostic samples for Begin; their host readback changes
+execution pacing and must not be treated as uninstrumented performance samples.
