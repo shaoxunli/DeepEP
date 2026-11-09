@@ -208,7 +208,7 @@ public:
             rows_pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-        if (profile_ && profile_->enabled) {
+        if (profile_ && profile_->enabled && profile_->detailed) {
             // V_MTE3 orders the copy engine, not the scalar timer. Diagnostic
             // runs drain SIMT here so its execution is not charged to submit.
             AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
@@ -227,7 +227,7 @@ public:
             }
             for (auto& bits : trace_pending_) bits = 0;
         }
-        if (profile_ && profile_->enabled) {
+        if (profile_ && profile_->enabled && profile_->detailed) {
             profile_->Add(profile_->submit_ns, submitted);
             profile_->wqes += rows_pending_;
             ++profile_->batches;
@@ -276,7 +276,7 @@ public:
             if (!trace_[p][7]) trace_[p][2] = at;
             trace_[p][3] = at; ++trace_[p][6]; ++trace_[p][7];
         }
-        if (profile_ && profile_->enabled) {
+        if (profile_ && profile_->enabled && profile_->detailed) {
             profile_->Add(profile_->scale_submit_ns, submitted);
             ++profile_->wqes; ++profile_->batches;
         }
@@ -329,11 +329,11 @@ private:
         if (!Tracing()) return;
         trace_[p][6] += n; trace_pending_[p / 32] |= 1U << (p % 32);
     }
-    __aicore__ uint64_t Now() const { return profile_ ? profile_->Now() : 0; }
+    __aicore__ uint64_t Now() const { return profile_ && profile_->detailed ? profile_->Now() : 0; }
     __aicore__ void Credit(uint32_t p) {
         const uint64_t started = Now();
         const bool pressure = Base::EnsurePayloadCredit(p);
-        if (profile_ && profile_->enabled) {
+        if (profile_ && profile_->enabled && profile_->detailed) {
             profile_->Add(profile_->credit_ns, started);
             ++profile_->credit_checks; profile_->credit_stalls += pressure;
         }
@@ -376,11 +376,11 @@ private:
             AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
             entry = {reinterpret_cast<uint64_t>(indices), p, row, field, 0, fill};
-            if (profile_ && profile_->enabled) {
+            if (profile_ && profile_->enabled && profile_->detailed) {
                 profile_->Add(profile_->build_ns, started);
                 ++profile_->refills;
             }
-        } else if (profile_ && profile_->enabled) ++profile_->hits;
+        } else if (profile_ && profile_->enabled && profile_->detailed) ++profile_->hits;
         if (rows_pending_ && active_state_ != peers_[p].state) Flush();
         if (!rows_pending_) {
             active_state_ = peers_[p].state;

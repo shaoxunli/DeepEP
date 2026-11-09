@@ -3,6 +3,10 @@
 #include <cstdint>
 #include <limits>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <sstream>
+#include <unistd.h>
 
 #include "common/types.h"
 #include "common/platform.h"
@@ -11,6 +15,7 @@
 #include "runtime/buffer_runtime.h"
 #include "ops/stream_allocator.h"
 #include "runtime/shmem_instance.h"
+#include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 
 namespace {
 
@@ -320,6 +325,28 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.udma_completion_signal_offset = static_cast<uint64_t>(workspace.udma_completion_signal_offset);
     tiling.combine_workspace_bytes = static_cast<uint64_t>(workspace.total_bytes);
 
+    // Opt-in diagnostics only. Each AIV owns one ordinary-GM row; blocking
+    // readback below keeps it alive and never changes SHMEM/output ownership.
+    auto diagnostic_enabled = [](const char* name) {
+        const char* value = std::getenv(name);
+        if (!value || !*value || std::strcmp(value, "0") == 0) return false;
+        TORCH_CHECK(std::strcmp(value, "1") == 0, name, " must be 0 or 1");
+        return true;
+    };
+    const bool coarse_profile = diagnostic_enabled("DEEPEP_CLOS_COMM_STAGE_PROFILE");
+    const bool detailed_profile = diagnostic_enabled("DEEPEP_CLOS_COMBINE_PROFILE");
+    torch::Tensor profile_output;
+    if (coarse_profile || detailed_profile) {
+        TORCH_CHECK(c10_npu::currentStreamCaptureStatusMayInitCtx() == c10_npu::CaptureStatus::None,
+                    "Combine profiling performs a CPU readback and cannot be graph-captured");
+        TORCH_CHECK(use_udma && epilogue && !aggregate && !pipeline_chunk_tokens && !shmem.TokenSchedule(),
+                    "Combine profiling requires the ordinary V2 UDMA communication path");
+        profile_output = allocator.Empty({resolved_num_aiv, ascend_deepep::kDispatchProfileWords},
+                                         x.options().dtype(torch::kInt64));
+        tiling.udma_profile_output = reinterpret_cast<uint64_t>(profile_output.data_ptr());
+        tiling.udma_profile_detailed = detailed_profile && !coarse_profile;
+    }
+
     c10::optional<torch::Tensor> pipeline_ready;
     if (pipeline_chunk_tokens) {
         TORCH_CHECK(shmem.QpsPerWorker() == 1, "aggregate pipeline requires one QP per worker");
@@ -369,6 +396,27 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         LaunchV1CombineKernel(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix,
                               send_head, recv_x, recv_topk_weights, tiling, symmetric_buffer, ffts_addr, use_udma,
                               phase);
+
+        if (profile_output.defined() && phase == CombinePhase::Communication) {
+            const auto cpu = profile_output.cpu();
+            const auto* values = cpu.data_ptr<int64_t>();
+            constexpr const char* names[] = {
+                "begin_ns", "metadata_ns", "setup_ns", "plan_ns", "send_ns", "build_ns", "credit_ns",
+                "submit_ns", "publish_ns", "incoming_ns", "quiet_ns", "barrier_ns", "refills", "hits",
+                "wqes", "batches", "origin_cycle", "remote_wait_ns", "local_sync_ns", "credit_checks",
+                "credit_stalls", "send_records", "scale_pack_ns", "scale_submit_ns", "scale_wait_ns",
+                "self_ns", "output_ns", "total_ns"};
+            for (int64_t core = 0; core < resolved_num_aiv; ++core) {
+                std::ostringstream line;
+                line << "[CLOS_COMBINE_PROFILE] rank=" << rank << " core=" << core
+                     << " weighted=" << tiling.has_topk_weights << " detailed=" << tiling.udma_profile_detailed;
+                for (uint32_t word = 0; word < sizeof(names) / sizeof(names[0]); ++word)
+                    line << ' ' << names[word] << '=' << values[core * ascend_deepep::kDispatchProfileWords + word];
+                const auto message = line.str() + '\n';
+                TORCH_CHECK(::write(STDERR_FILENO, message.data(), message.size()) == static_cast<ssize_t>(message.size()),
+                            "Failed to write Clos combine profiling record");
+            }
+        }
 
         return CombineResult{recv_x, recv_topk_weights};
     };

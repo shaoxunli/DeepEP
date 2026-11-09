@@ -625,6 +625,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.dispatch_experiment_flags =
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_WQE_CACHE") ? ascend_deepep::kDispatchWqeCache : 0U) |
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PROFILE") ? ascend_deepep::kDispatchProfile : 0U) |
+        (DispatchExperiment("DEEPEP_CLOS_COMM_STAGE_PROFILE")
+             ? ascend_deepep::kDispatchProfile | ascend_deepep::kDispatchStageOnly : 0U) |
         (DispatchExperiment("DEEPEP_CLOS_DISPATCH_PEER_CURSOR") ? ascend_deepep::kDispatchPeerCursor : 0U) |
         (x_scales.has_value() && num_scales && DispatchExperiment("DEEPEP_CLOS_DISPATCH_SIMT_SCALES")
              ? ascend_deepep::kDispatchSimtScales
@@ -852,13 +854,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
             "credit_ns",     "submit_ns",     "publish_ns",    "incoming_ns",  "quiet_ns",      "barrier_ns",
             "refills",       "hits",          "wqes",          "batches",      "origin_cycle",  "remote_wait_ns",
             "local_sync_ns", "credit_checks", "credit_stalls", "send_records", "scale_pack_ns", "scale_submit_ns",
-            "scale_wait_ns"};
+            "scale_wait_ns", "self_ns", "output_ns", "total_ns"};
         for (int64_t core = 0; core < resolved_num_aiv; ++core) {
             std::ostringstream line;
             line << "[CLOS_DISPATCH_PROFILE] rank=" << rank << " core=" << core << " cached=" << cached_mode
                  << " wqe_cache=" << bool(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchWqeCache)
                  << " peer_cursor=" << bool(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchPeerCursor)
-                 << " scale_overlap=" << bool(tiling.packed_scale_ready);
+                 << " scale_overlap=" << bool(tiling.packed_scale_ready)
+                 << " detailed=" << !(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchStageOnly);
             for (uint32_t word = 0; word < sizeof(names) / sizeof(names[0]); ++word)
                 line << ' ' << names[word] << '=' << values[core * profile_stride + word];
             // One short write keeps records from different torchrun processes

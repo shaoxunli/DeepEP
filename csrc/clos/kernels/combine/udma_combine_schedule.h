@@ -10,8 +10,11 @@ namespace ascend_deepep::udma {
 template <uint32_t Capacity, uint32_t Phase, uint32_t Qps, class Resource>
 __aicore__ inline void CombineRemoteImpl(
     Resource& resource, GM_ADDR x, GM_ADDR weights, GM_ADDR src_idx, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
-    GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
+    GM_ADDR workspace, const CombineTilingData& td, uint32_t core, DispatchProfile* diagnostic = nullptr)
 {
+    DispatchProfile inactive{false};
+    auto& profile = diagnostic ? *diagnostic : inactive;
+    uint64_t stage = profile.Now();
     constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + sizeof(uint64_t));
     static_assert(sender_bytes <= 216 * 1024);
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
@@ -22,7 +25,8 @@ __aicore__ inline void CombineRemoteImpl(
     // the handle keeps its GM storage alive through the final send completion.
     const auto* indices = reinterpret_cast<const __gm__ int32_t*>(src_idx);
     CombineSenderT<Capacity, Qps, const __gm__ int32_t*> sender(td, core, reinterpret_cast<__ubuf__ uint8_t*>(wq.GetPhyAddr()), workspace,
-        x, weights, UINT32_MAX, 0, 1, 0, !simt_weights);
+        x, weights, UINT32_MAX, 0, 1, 0, !simt_weights, &profile);
+    profile.Add(profile.setup_ns, stage); stage = profile.Now();
     AscendC::GlobalTensor<int32_t> rank_gm;
     rank_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
     // Dispatch stores all channels of one source rank contiguously. Ownership
@@ -46,6 +50,7 @@ __aicore__ inline void CombineRemoteImpl(
         end[p] = begin + PeerRowBoundary(length, lane + 1U, td.udma_workers_per_peer,
             td.rank, peer, td.udma_ranks_per_group, td.udma_cross_lane0_weight);
     }
+    profile.Add(profile.plan_ns, stage); stage = profile.Now();
     for (uint32_t first = 0; first < sender.Count();) {
         const uint32_t last = PeerWindowEnd(sender, td.rank, td.world_size, td.udma_ranks_per_group, td.udma_peer_order, first);
         uint32_t remaining = 0;
@@ -84,34 +89,43 @@ __aicore__ inline void CombineRemoteImpl(
         if (td.udma_peer_order == kGroupWindowOrder) sender.Flush();
         first = last;
     }
+    profile.Add(profile.send_ns, stage); stage = profile.Now();
     if constexpr (Phase == 1) {
         sender.Flush(); // Drain WQE staging, not the asynchronous payload reads.
     } else {
         sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
-        WaitIncoming<false>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, td.num_channels, td.udma_workers_per_peer * Qps);
+        profile.Add(profile.publish_ns, stage); stage = profile.Now();
+        IncomingObservation observation{profile.origin_cycle};
+        WaitIncoming<false>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core,
+            td.num_channels, td.udma_workers_per_peer * Qps, profile.enabled ? &observation : nullptr);
+        profile.remote_wait_ns = observation.remote_ns; profile.local_sync_ns = observation.local_ns;
+        profile.Add(profile.incoming_ns, stage); stage = profile.Now();
         sender.Quiet();
+        profile.Add(profile.quiet_ns, stage); stage = profile.Now();
         // UDMA SO markers do not cover SIMT stores issued by other AIVs.
         // Match Dispatch's full-rank completion before Reduce/workspace reuse.
         if (simt_weights)
             aclshmemi_sync_npu_v4<true>(0);
         else
             AscendC::SyncAll<true>();
+        profile.Add(profile.barrier_ns, stage);
+        profile.send_records = sender.Count() * Qps;
     }
 }
 template <uint32_t Phase = 0, class Resource>
 __aicore__ inline void CombineRemote(
     Resource& r, GM_ADDR x, GM_ADDR weights, GM_ADDR idx, GM_ADDR rp, GM_ADDR cp,
-    GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
+    GM_ADDR workspace, const CombineTilingData& td, uint32_t core, DispatchProfile* diagnostic = nullptr)
 {
     if (td.udma_qps_per_worker == 2) {
         if (GroupOwnerOrder(td.udma_peer_order))
-            CombineRemoteImpl<kGroupPeerCapacity, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core);
+            CombineRemoteImpl<kGroupPeerCapacity, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core, diagnostic);
         else
-            CombineRemoteImpl<kMaxPeers, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core);
+            CombineRemoteImpl<kMaxPeers, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core, diagnostic);
     } else if (GroupOwnerOrder(td.udma_peer_order))
-        CombineRemoteImpl<kGroupPeerCapacity, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core);
+        CombineRemoteImpl<kGroupPeerCapacity, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core, diagnostic);
     else
-        CombineRemoteImpl<kMaxPeers, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core);
+        CombineRemoteImpl<kMaxPeers, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core, diagnostic);
 }
 #endif
 } // namespace ascend_deepep::udma

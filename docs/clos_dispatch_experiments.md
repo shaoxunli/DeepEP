@@ -59,7 +59,7 @@ flags use the previously reserved 32-bit tiling word. Diagnostic profiling adds
 an optional GM pointer to the tiling ABI; rebuild host and device libraries
 together. Every launched AIV still participates
 in Begin, incoming synchronization, and the final collective, including AIVs
-with no payload work. Combine and the token schedule remain unchanged.
+with no payload work. The cache does not change combine or the token schedule.
 
 ## Diagnostic timing
 
@@ -67,16 +67,17 @@ For a short diagnostic run, set `DEEPEP_CLOS_DISPATCH_PROFILE=1`. Each AIV emits
 one private 256-byte GM row per dispatch invocation, including empty payload
 AIVs. At most 16 KiB is allocated through the existing stream allocator and
 remains live until the CPU readback finishes. After the final communication
-collective, each AIV reuses the drained WQE scratch for its own record, orders
+collective and output-copy drain, each AIV reuses the drained WQE scratch for its own record, orders
 scalar writes with `S_MTE3`, and drains the GM store with `MTE3_S`. The Host
 emits `[CLOS_DISPATCH_PROFILE]` lines after readback, independent of device
 printf support. `cached=0/1` distinguishes fresh/cached dispatch. Ascend950's
 system counter is 1 GHz; fields ending in `_ns` contain system-counter deltas.
 
 Top-level intervals are `begin_ns`, `metadata_ns`, `setup_ns`, `plan_ns`,
-`send_ns`, `publish_ns`, `incoming_ns`, `quiet_ns`, and `barrier_ns`. They cover
-the measured path through the final communication collective, not the entire
-API or output epilogue. Scale packing, top-k initialization, and output address
+`send_ns`, `publish_ns`, `incoming_ns`, `quiet_ns`, `barrier_ns`, and `output_ns`.
+`output_ns` covers the kernel's output-copy/handle tail after the final
+communication collective. `total_ns` spans Begin entry through this tail, before
+record storage; it is not the entire API. Scale packing, top-k initialization, and output address
 preparation before Begin are also outside these intervals. Begin includes
 marker reset and the entry collective;
 incoming includes the existing local AIV synchronization. Descriptor setup
@@ -91,6 +92,36 @@ construction timer stops; `V_MTE3` alone only orders the copy engine. This
 drain is absent from performance mode. Submit covers UB-to-SQ copy and
 doorbell issue, not payload delivery. `refills`,
 `hits`, `wqes`, and `batches` diagnose cache reuse and short submissions.
+
+### Matched dispatch/combine stages
+
+Set `DEEPEP_CLOS_COMM_STAGE_PROFILE=1` for coarse timing of both operators.
+It takes precedence over detailed profiling and skips per-batch timestamps and
+the additional SIMT `V_S` drain. For detailed timing instead, leave that switch
+off and set `DEEPEP_CLOS_DISPATCH_PROFILE=1` and
+`DEEPEP_CLOS_COMBINE_PROFILE=1`. These switches default off, accept only `0/1`,
+and perform blocking CPU readback; graph capture is unsupported. Use the same
+settings on every rank. Keep dispatch tracing off for the matched coarse test.
+
+Combine profiling supports ordinary V2 UDMA communication, excluding token
+and aggregate-pipeline schedules. Rebuild both host and device libraries for
+the new combine tiling fields. `[CLOS_COMBINE_PROFILE]` records use the same
+32-word per-AIV layout; `weighted=0/1` identifies the variant. `self_ns` covers
+the self-rank copy and its final DMA drain. `setup_ns` includes optional SIMT
+weight issue before constructing the payload sender. `total_ns` stops before
+record storage and before the separate V2 reduction kernel.
+
+Both operators record `remote_wait_ns` and `local_sync_ns` separately inside
+`incoming_ns`; do not count these twice. `send_ns` covers the scheduler/payload
+loop and `publish_ns` includes any final staged batch plus terminal markers.
+Neither means the payload has finished transferring: the existing incoming
+wait, Quiet and final synchronization still establish completion.
+
+Keep raw records per invocation/rank/AIV. Compare one complete core record at
+a time, not a sum of independently selected stage maxima. Compare diagnostic
+kernel distributions with profiling disabled; CPU readback changes host pacing
+and detailed timing adds synchronization. Do not attribute a performance gap
+to address layout from these timers alone.
 
 Counter-store overhead is outside these counters but inside kernel duration;
 The diagnostic SIMT drain, CPU readback, and logging also perturb overlap and

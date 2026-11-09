@@ -3,6 +3,7 @@
 #include "kernels/common/udma_shared_sender.h"
 #include "common/types.h"
 #include "utils/debug/asc_assert.h"
+#include "kernels/dispatch/udma_dispatch_profile.h"
 
 namespace ascend_deepep::udma {
 // Combine uses the request area for <=32 spans, each describing one contiguous
@@ -80,7 +81,7 @@ public:
     __aicore__ CombineSenderT(
         const CombineTilingData& td, uint32_t core, __ubuf__ uint8_t* scratch, GM_ADDR workspace, GM_ADDR x,
         GM_ADDR weights, uint32_t peer_start = UINT32_MAX, uint32_t rotation = 0, uint32_t row_step = 1,
-        uint32_t index_step = 0, bool send_weights = true)
+        uint32_t index_step = 0, bool send_weights = true, DispatchProfile* profile = nullptr)
         : Base(
               td.rank, td.world_size, core, peer_start == UINT32_MAX ? td.udma_peers_per_worker : kMaxPeers, scratch,
               workspace, td.udma_completion_signal_offset, peer_start, rotation, td.udma_peer_order, td.udma_ranks_per_group,
@@ -90,7 +91,7 @@ public:
           weights_(reinterpret_cast<uint64_t>(weights)),
           row_step_(row_step),
           index_step_(index_step ? index_step : row_step),
-          fields_(td.has_topk_weights && send_weights ? 2U : 1U)
+          fields_(td.has_topk_weights && send_weights ? 2U : 1U), profile_(profile)
     {
         auto* bases = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kCombineBasesOffset);
         for (uint32_t lane = 0; lane < Qps; ++lane)
@@ -109,7 +110,12 @@ public:
             Flush();
         if (!rows_pending_) {
             active_state_ = peers_[p].state;
-            Base::EnsurePayloadCredit(p);
+            const uint64_t started = Now();
+            const bool pressure = Base::EnsurePayloadCredit(p);
+            if (Detailed()) {
+                profile_->Add(profile_->credit_ns, started);
+                ++profile_->credit_checks; profile_->credit_stalls += pressure;
+            }
         }
         const uint32_t n = count < kBatchWqes - rows_pending_ ? count : kBatchWqes - rows_pending_;
         auto* span = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + spans_ * 4U;
@@ -160,6 +166,7 @@ public:
     {
         if (!rows_pending_)
             return;
+        const uint64_t started = Now();
         const uint64_t rank_slot = uint64_t(td_.rank) * td_.token_capacity;
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
@@ -175,7 +182,18 @@ public:
             td_.expanded_x, td_.single_source_slots, td_.num_expanded_tokens);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+        if (Detailed()) {
+            // V_MTE3 does not stall the scalar timer; measure completed SIMT.
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            profile_->Add(profile_->build_ns, started);
+        }
+        const uint64_t submitted = Now();
         Base::SubmitPayload(rows_pending_);
+        if (Detailed()) {
+            profile_->Add(profile_->submit_ns, submitted);
+            profile_->wqes += rows_pending_; ++profile_->batches;
+        }
         rows_pending_ = 0;
         spans_ = 0;
     }
@@ -198,6 +216,9 @@ public:
     }
 
 private:
+    DispatchProfile* profile_;
+    __aicore__ bool Detailed() const { return profile_ && profile_->enabled && profile_->detailed; }
+    __aicore__ uint64_t Now() const { return Detailed() ? profile_->Now() : 0; }
     const CombineTilingData& td_;
     uint64_t x_, weights_;
     uint32_t row_step_, index_step_, fields_;

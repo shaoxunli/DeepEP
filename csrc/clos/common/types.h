@@ -39,6 +39,7 @@ inline constexpr uint32_t kDispatchPeerCursor = 4U;
 inline constexpr uint32_t kDispatchTrace = 8U;
 inline constexpr uint32_t kDispatchSimtScales = 16U;
 inline constexpr uint32_t kDispatchPackedScales = 32U;
+inline constexpr uint32_t kDispatchStageOnly = 64U;
 inline constexpr uint32_t kDispatchProfileWords = 32U; // 256-byte private row per AIV.
 
 struct alignas(8) DispatchLayoutTilingData {
@@ -130,6 +131,8 @@ struct alignas(8) CombineTilingData {
     uint64_t topk_weights_buffer_offset;
     uint64_t udma_completion_signal_offset;
     uint64_t combine_workspace_bytes;
+    uint64_t udma_profile_output = 0; // Private per-AIV diagnostic rows, ordinary GM.
+    uint32_t udma_profile_detailed = 0;
     uint32_t udma_peer_order;
     uint32_t udma_ranks_per_group;
     uint32_t udma_peers_per_worker;

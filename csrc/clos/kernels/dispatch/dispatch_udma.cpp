@@ -136,11 +136,13 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     }
     // Clears incoming payload markers and publishes this invocation's output
     // addresses/top-k initialization before remote writes. Every AIV participates.
+    profile.detailed = !(tiling.dispatch_experiment_flags & ascend_deepep::kDispatchStageOnly);
     profile.trace = (tiling.dispatch_experiment_flags & ascend_deepep::kDispatchTrace) != 0;
     profile.rank = tiling.rank; profile.world = tiling.world_size; profile.cores = core_num;
     profile.markers = tiling.udma_workers_per_peer * tiling.udma_qps_per_worker;
     profile.qps = tiling.udma_qps_per_worker;
     uint64_t profile_start = profile.Now();
+    profile.entry_cycle = profile_start;
     ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
         core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
         tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
@@ -197,6 +199,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
             dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num, profile);
     }
 
+    const uint64_t output_started = profile.Now();
     const int32_t actual_recv_tokens = rank_prefix_gm.GetValue((world_size - 1) * world_size + rank);
     const int32_t recv_tokens_to_copy = DispatchMin(actual_recv_tokens, num_output_tokens);
     const int32_t tokens_per_worker = recv_tokens_to_copy / core_num;
@@ -373,6 +376,13 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+    }
+    if (profile.enabled) {
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID5);
+        profile.Add(profile.output_ns, output_started);
+        profile.total_ns = profile.Now() - profile.entry_cycle;
+        profile.Store(tiling.udma_profile_output, core_idx, resource.template GetBufferByByte<uint64_t>(0));
     }
 }
 

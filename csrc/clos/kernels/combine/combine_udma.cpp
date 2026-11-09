@@ -108,6 +108,10 @@ __aicore__ inline void V1CombineUdmaImpl(
     AscendC::DataCopyPadExtParams<int32_t> int32_pad_params{false, 0, 0, 0};
     AscendC::DataCopyPadExtParams<float> float_pad_params{false, 0, 0, 0};
 
+    ascend_deepep::udma::DispatchProfile profile{
+        DoCommunication && Phase == 0 && tiling.udma_profile_output != 0};
+    profile.detailed = tiling.udma_profile_detailed != 0;
+    uint64_t profile_started = 0;
     if constexpr (DoCommunication && Phase == 1) {
         ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
             core_idx, num_channels, resource.template GetBufferByByte<uint64_t>(0),
@@ -147,11 +151,16 @@ __aicore__ inline void V1CombineUdmaImpl(
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
 
         if constexpr (Phase == 0) {
+            profile.entry_cycle = profile.Now();
+            profile_started = profile.entry_cycle;
             ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
                 core_idx, num_channels, resource.template GetBufferByByte<uint64_t>(0),
                 tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(num_channels) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
         }
 
+        profile.Add(profile.begin_ns, profile_started);
+        profile.origin_cycle = profile.Now();
+        profile_started = profile.Now();
         // Each AIV copies its self-rank channel before the remote send phase.
         const int32_t source_rank = rank;
         const int32_t source_rank_base =
@@ -241,16 +250,21 @@ __aicore__ inline void V1CombineUdmaImpl(
         // area. MTE3_MTE2 only orders the next DMA load, not these scalar stores.
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+        profile.Add(profile.self_ns, profile_started);
         if (tiling.udma_token_schedule) {
             ascend_deepep::udma::CombineTokenRemote<Phase>(resource, x, topk_weights, src_idx, rank_prefix_matrix,
                 channel_prefix_matrix, symmetric_buffer, tiling, core_idx);
         } else {
             ascend_deepep::udma::CombineRemote<Phase>(resource, x, topk_weights, src_idx, rank_prefix_matrix,
-                channel_prefix_matrix, symmetric_buffer, tiling, core_idx);
+                channel_prefix_matrix, symmetric_buffer, tiling, core_idx, &profile);
         }
 
     }
 
+    if (profile.enabled) {
+        profile.total_ns = profile.Now() - profile.entry_cycle;
+        profile.Store(tiling.udma_profile_output, core_idx, resource.template GetBufferByByte<uint64_t>(0));
+    }
     if constexpr (DoReduction) {
         // Communication is complete, so the reduction phase reuses UB from zero.
         AscendC::LocalTensor<uint8_t> input_pingpong_bytes_ub =

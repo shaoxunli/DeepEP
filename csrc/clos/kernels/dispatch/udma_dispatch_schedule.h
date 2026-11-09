@@ -272,7 +272,6 @@ __aicore__ inline void DispatchRemoteImpl(
     // All sender/metadata readers have drained; the initial WQE area can now
     // stage this AIV's private diagnostic record before output-copy reuse.
     profile.send_records = sender.Count() * Qps;
-    profile.Store(td.udma_profile_output, core, resource.template GetBufferByByte<uint64_t>(0));
     sender.StoreTrace(td.udma_profile_output, core, resource.template GetBufferByByte<uint64_t>(0));
 }
 template <class Resource>

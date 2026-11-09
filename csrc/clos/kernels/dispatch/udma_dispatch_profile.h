@@ -10,6 +10,8 @@ namespace ascend_deepep::udma {
 struct DispatchProfile {
     __aicore__ explicit DispatchProfile(bool active) : enabled(active) {}
     bool enabled;
+    bool detailed = true;
+    uint64_t entry_cycle = 0, self_ns = 0, output_ns = 0, total_ns = 0;
     bool trace = false;
     uint32_t rank = 0, world = 0, cores = 0, markers = 0, qps = 0;
     uint64_t origin_cycle = 0, remote_wait_ns = 0, local_sync_ns = 0;
@@ -48,7 +50,9 @@ struct DispatchProfile {
         scratch.SetValue(21, send_records);
         scratch.SetValue(22, scale_pack_ns); scratch.SetValue(23, scale_submit_ns);
         scratch.SetValue(24, scale_wait_ns);
-        for (uint32_t i = 25; i < kDispatchProfileWords; ++i) scratch.SetValue(i, 0);
+        scratch.SetValue(25, self_ns); scratch.SetValue(26, output_ns);
+        scratch.SetValue(27, total_ns);
+        for (uint32_t i = 28; i < kDispatchProfileWords; ++i) scratch.SetValue(i, 0);
         AscendC::GlobalTensor<uint64_t> out;
         out.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(output) + uint64_t(core) * Stride());
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID5);
