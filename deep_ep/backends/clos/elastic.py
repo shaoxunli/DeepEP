@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, List, Optional, Tuple, Union
 
-from ._native import get_native_class
+from ._native import get_native_class, load_native_module
 from .buffer import (
     _BOOTSTRAP_LOCK,
     _compact_extra_tensors,
@@ -1026,12 +1027,24 @@ class ElasticBuffer:
         communication stream after communication and before final reduction.
         """
 
+        profile_ticks = {} if (
+            os.environ.get("DEEPEP_CLOS_COMBINE_PYTHON_PROFILE") == "1"
+            and os.environ.get("DEEPEP_CLOS_COMBINE_ARRIVAL_PROFILE") == "1"
+        ) else None
+        if profile_ticks is not None:
+            profile_ticks["python_entry_ns"] = time.time_ns()
         self._ensure_alive()
         self._validate_handle(handle)
+        if profile_ticks is not None:
+            profile_ticks["handle_checked_ns"] = time.time_ns()
         _validate_combine_tensors(x, handle, topk_weights, bias)
+        if profile_ticks is not None:
+            profile_ticks["tensors_checked_ns"] = time.time_ns()
         _validate_bool("async_with_compute_stream", async_with_compute_stream)
         _validate_bool("allocate_on_comm_stream", allocate_on_comm_stream)
         allocation_stream_id = _get_allocation_stream_id(allocate_on_comm_stream)
+        if profile_ticks is not None:
+            profile_ticks["allocation_stream_ns"] = time.time_ns()
         _validate_event_dependency(previous_event, allocate_on_comm_stream)
         _validate_epilogue_event(previous_event_before_epilogue)
         _validate_nonnegative_int("num_qps", num_qps)
@@ -1039,6 +1052,8 @@ class ElasticBuffer:
             raise NotImplementedError("intranode V2 does not use RDMA QPs")
         resolved_num_sms = handle.num_sms if num_sms == 0 else num_sms
         _validate_num_sms(resolved_num_sms, self.num_device_aiv)
+        if profile_ticks is not None:
+            profile_ticks["arguments_checked_ns"] = time.time_ns()
         policy = (
             self._udma_auto_policy.for_row_bytes(
                 resolved_num_sms,
@@ -1049,12 +1064,16 @@ class ElasticBuffer:
         )
         if resolved_num_sms != handle.num_sms:
             raise ValueError("combine num_sms must match dispatch EPHandle")
+        if profile_ticks is not None:
+            profile_ticks["policy_ready_ns"] = time.time_ns()
         bias_0, bias_1 = self._unpack_bias(bias)
         config = Config(
             num_aiv=resolved_num_sms,
             udma_peers_per_worker=policy.peers_per_worker if policy else self._udma_config.udma_peers_per_worker,
             udma_wqes_per_visit=policy.wqes_per_visit if policy else self._udma_config.udma_wqes_per_visit,
         )
+        if profile_ticks is not None:
+            profile_ticks["config_ready_ns"] = time.time_ns()
         (
             rank_prefix_matrix,
             _,
@@ -1080,8 +1099,12 @@ class ElasticBuffer:
                 raise ValueError("aggregate pipeline requires expanded UDMA, 32/64 AIV and serial baseline selection")
             if self._udma_schedule == "token" and (resolved_num_sms != 32 or self.num_ranks > 8):
                 raise ValueError("self-send aggregate pipeline requires 32 AIV and EP <= 8")
+        if profile_ticks is not None:
+            profile_ticks["layout_ready_ns"] = time.time_ns()
         dependency = previous_event or _try_record_event(None)
-        with _use_stream_after_event(self._communication_stream, dependency):
+        if profile_ticks is not None:
+            profile_ticks["event_ready_ns"] = time.time_ns()
+        with _use_stream_after_event(self._communication_stream, dependency, profile_ticks):
             combine_x, combine_topk_weights = x, topk_weights
             single_source_slots = (
                 getattr(handle, "_single_source_slots", None)
@@ -1105,6 +1128,8 @@ class ElasticBuffer:
                     single_source_slots,
                     rank_prefix_matrix if single_source_slots is not None else None,
                 )
+            if profile_ticks is not None:
+                profile_ticks["native_call_ns"] = time.time_ns()
             epilogue = self._native._intranode_combine_begin(
                 combine_x,
                 combine_topk_weights,
@@ -1145,6 +1170,13 @@ class ElasticBuffer:
                 epilogue,
             ),
         )
+        if profile_ticks is not None:
+            # Capture through the same native buffer as sample/host records.
+            # The benchmark drains this only after profiling; no extra readback.
+            fields = " ".join(f"{key}={value}" for key, value in profile_ticks.items())
+            load_native_module()._append_combine_profile_log(
+                f"[CLOS_COMBINE_PYTHON] rank={self.rank} {fields}\n"
+            )
         return combined_x, combined_topk_weights, event
 
     def _finish_comm_event(self, async_with_compute_stream: bool, extra_tensors: Tuple[Any, ...]) -> EventOverlap:
@@ -1187,10 +1219,14 @@ class ElasticBuffer:
 
 
 @contextmanager
-def _use_stream_after_event(stream: Any, event: Optional[EventHandle]):
+def _use_stream_after_event(stream: Any, event: Optional[EventHandle], profile_ticks=None):
     with _use_comm_stream(stream):
+        if profile_ticks is not None:
+            profile_ticks["stream_enter_ns"] = time.time_ns()
         if event is not None:
             event.current_stream_wait()
+        if profile_ticks is not None:
+            profile_ticks["dependency_wait_ns"] = time.time_ns()
         yield
 
 

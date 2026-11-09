@@ -344,6 +344,21 @@ and `system_clock` use the host real-time clock; compare only within one server
 and reject non-monotonic sample boundaries. Device-clock offsets do not by
 themselves establish host-clock alignment between servers.
 
+`DEEPEP_CLOS_COMBINE_PYTHON_PROFILE=1` adds Python boundaries when arrival
+profiling is also enabled. It defaults off. Records separate handle/tensor
+validation, allocation-stream lookup, argument validation, policy resolution,
+Config/layout preparation, dependency-event creation, communication-stream
+entry, wait submission and the native-call boundary. The last interval to
+`native_entry_ns` includes argument evaluation and binding/runtime wrappers;
+it is not a pure Python-to-C++ crossing cost. Event/wait timestamps measure
+host submission, not device completion. Expanded input may also launch an
+aggregate before the native-call boundary; do not classify that interval as
+mere metadata preparation without checking `do_expand`.
+Records join the existing log capture after combine returns, with no additional
+tensor readback. Keep capture enabled for the sampled interval to defer printing.
+Fine-grained timestamps add instrumentation overhead and do not represent a
+clean-production API latency measurement.
+
 The Clos benchmark now captures combine diagnostic log lines in host memory
 before warmup and emits them after profiler stop and device synchronization.
 The internal `_begin_combine_profile_log_capture`, `_append_combine_profile_log`,
