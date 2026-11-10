@@ -1,0 +1,28 @@
+--- a/examples/shmem_perftest/udma_perftest/main.cpp
++++ b/examples/shmem_perftest/udma_perftest/main.cpp
+@@ -180,11 +180,10 @@
+         int peer_pe = (pe_id + 1) % n_pes;
+         if (test_mode == perftest::TEST_MODE_UDMA_PUT) {
+             std::cout << "\n[Verification] put: checking..." << std::endl;
+-            if (pe_id != prof_pe) {
+-                T expected_val = static_cast<T>(prof_pe + 10);
+-                if (!compare_values(dst_host.data(), expected_val, total_elements, "dst", "expected")) {
+-                    verify_success = false;
+-                }
++            const int target_pe = (prof_pe + 1) % n_pes;
++            const T expected_val = static_cast<T>(pe_id == target_pe ? prof_pe + 10 : pe_id + 100);
++            if (!compare_values(dst_host.data(), expected_val, total_elements, "dst", "expected")) {
++                verify_success = false;
+             }
+         } else if (test_mode == perftest::TEST_MODE_UDMA_GET) {
+             std::cout << "\n[Verification] get: checking..." << std::endl;
+@@ -196,7 +195,8 @@
+             }
+         } else if (test_mode == perftest::TEST_MODE_UDMA_BI_PUT) {
+             std::cout << "\n[Verification] bi_put: checking..." << std::endl;
+-            T expected_val = static_cast<T>(peer_pe + 10);
++            const int sender_pe = (pe_id - 1 + n_pes) % n_pes;
++            T expected_val = static_cast<T>(sender_pe + 10);
+             if (!compare_values(dst_host.data(), expected_val, total_elements, "dst", "expected")) {
+                 verify_success = false;
+             }

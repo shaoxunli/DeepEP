@@ -20,8 +20,21 @@ bash scripts/build.sh -examples -soc_type Ascend950
 **旧样例限制：** DeepEP 当前锁定的 SHMEM `836d3fd6` 中，PE>2 的单向 PUT 错把所有非发送 PE
 都当作接收方；环形 PUT 的接收校验使用了下一 PE，而实际数据来自上一 PE。EP2 时这两个问题
 不暴露。脚本对 `pool/ring` 检查对应校验表达式，未识别为修正版本时停止。先跑默认 EP2 对照，
-不要为了跑 EP32 删除精度检查。这里不自动升级 SHMEM、不修改样例或生产 kernel。
+不要为了跑 EP32 删除精度检查。这里不自动升级 SHMEM，也不修改生产 kernel。
 源码检查不能证明二进制由该源码构建；必须提供配套产物。报告保存源码、二进制及动态库指纹供核对。
+
+为锁定版提供了 [host 校验补丁](perftest-host-verification.patch)，只修正 PUT 接收方和环形 PUT
+来源的期望值，不修改 kernel、提交、quiet 或计时。需要 EP32 时，两台在同版本 SHMEM 源码上应用并重编样例：
+
+```bash
+# DEEPEP_ROOT 指向包含本脚本的 DeepEP 仓库；SHMEM_ROOT 指向样例源码
+PATCH="$DEEPEP_ROOT/benchmarks/shmem_udma/perftest-host-verification.patch"
+git -C "$SHMEM_ROOT" apply --check "$PATCH" && \
+git -C "$SHMEM_ROOT" apply "$PATCH"
+```
+
+然后在 SHMEM 目录执行上面的构建命令。补丁未通过 `--check` 时不要强制应用：可能已修正，或源码
+版本不同，先核对。补丁仅覆盖本脚本使用的 PUT/BI_PUT，不声明修复旧样例的其他模式。
 
 ## 第一轮：EP2 单卡对
 
