@@ -9,6 +9,8 @@ Modified by Joyce_An 2026
 
 HT 和 LL 有独立的设备正确性与 kernel 测量入口，运行方式见[测试说明](../tests/README.md)，统计口径见[性能说明](../docs/performance.md)。
 
+底层 UDMA 环境对照可使用 [SHMEM perftest 诊断脚本](shmem_udma/README.md)，支持双节点正反方向、完整会话内单卡对和跨机环形并发，保留原始日志及库指纹。
+
 ## 无设备运行
 
 从仓库根目录使用 Python 3.11+，无需 Torch、NumPy 或 NPU：
