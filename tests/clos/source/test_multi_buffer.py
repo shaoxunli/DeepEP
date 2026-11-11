@@ -120,8 +120,9 @@ def combine(buffer, out, args, rank, delta=0.0):
         golden._assert_equal("multi-buffer combined weights", result[1], weights)
 
 
-def run_rank(rank, args):
-    device = args.first_device + rank
+def run_rank(local_rank, args):
+    rank = args.node_rank * (args.ep_size // args.nnodes) + local_rank
+    device = args.first_device + local_rank
     os.environ.update(RANK=str(rank), LOCAL_RANK=str(device), WORLD_SIZE=str(args.ep_size))
     torch.npu.set_device(device)
     dist.init_process_group("hccl", init_method=args.dist_init_method, rank=rank, world_size=args.ep_size)
@@ -143,6 +144,7 @@ def run_rank(rank, args):
             group, capacity, hidden=args.hidden, num_topk=args.num_topk, use_fp8_dispatch=args.dtype == "fp8", **kw
         )
 
+    print(f"MULTI_BUFFER_STAGE rank={rank} pid={os.getpid()} stage=create_old", flush=True)
     old = create(size_hint, small)
     pending = dispatch(old, small, rank)
     check_dispatch(pending, small, rank)
@@ -150,6 +152,7 @@ def run_rank(rank, args):
     cached_buffer = old
     # Exact customer lifetime: new construction happens while old outputs and
     # an unconsumed combine handle remain live.
+    print(f"MULTI_BUFFER_STAGE rank={rank} stage=create_new", flush=True)
     buffer = create(2 * size_hint, args)
     assert old._native.get_comm_meta_ptr() != buffer._native.get_comm_meta_ptr()
     assert old._native.get_workspace_ptr() != buffer._native.get_workspace_ptr()
@@ -193,6 +196,7 @@ def run_rank(rank, args):
             stream.synchronize()
         return stream.npu_stream
 
+    print(f"MULTI_BUFFER_STAGE rank={rank} stage=concurrent", flush=True)
     with ThreadPoolExecutor(max_workers=2) as pool:
         a = pool.submit(worker, cached_buffer, small, 16.0)
         b = pool.submit(worker, buffer, args, 32.0)
@@ -201,6 +205,7 @@ def run_rank(rank, args):
     check_dispatch(pending, small, rank)
     # Destroy either instance independently, then reuse the freed ID while the
     # other Buffer remains capable of dispatch/combine with its old handle.
+    print(f"MULTI_BUFFER_STAGE rank={rank} stage=destroy_and_recreate", flush=True)
     cached_buffer.destroy()
     check_dispatch(pending, small, rank)
     replacement = create(size_hint, small)
@@ -248,6 +253,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--api", choices=("v1", "v2"), required=True)
     p.add_argument("--ep-size", type=int, default=8)
+    p.add_argument("--nnodes", type=int, default=1)
+    p.add_argument("--node-rank", type=int, default=0)
     p.add_argument("--first-device", type=int, default=0)
     p.add_argument("--small-tokens", type=int, default=17)
     p.add_argument("--num-tokens", type=int, default=129)
@@ -265,8 +272,17 @@ def main():
     args = p.parse_args()
     if args.expand and args.api != "v2":
         p.error("--expand requires --api v2")
+    if args.nnodes < 1 or args.ep_size < 2 or args.ep_size % args.nnodes:
+        p.error("--ep-size must be divisible by positive --nnodes")
+    if not 0 <= args.node_rank < args.nnodes:
+        p.error("--node-rank must be in [0, nnodes)")
+    local_size = args.ep_size // args.nnodes
+    if args.first_device < 0 or args.first_device + local_size > 8:
+        p.error("each node must use at most eight local devices")
+    if args.nnodes > 1 and args.dist_init_method == "tcp://127.0.0.1:29780":
+        p.error("multi-node runs require a shared, reachable --dist-init-method")
     args.expert_alignment = 1
-    mp.spawn(run_rank, args=(args,), nprocs=args.ep_size, join=True)
+    mp.spawn(run_rank, args=(args,), nprocs=local_size, join=True)
 
 
 if __name__ == "__main__":

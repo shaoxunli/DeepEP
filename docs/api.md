@@ -101,6 +101,18 @@ python tests/clos/source/test_multi_buffer.py \
 
 `--api v1` 验证 V1；V2 可加 `--expand` 覆盖专家展开与 aggregate/combine，`--dtype fp8` 覆盖量化 payload 和 scale。每项会逐 rank 输出 `MULTI_BUFFER_PASSED`，同时要求整个命令退出码为 0。
 
+多机 EP64 在 8 台节点上分别执行同一命令；`NODE_RANK` 取 0～7，
+`MASTER_ADDR` 为 0 号节点的可达 IP，`MASTER_PORT` 为该作业独占的空闲端口。
+每台启动 8 个进程，使用本机 device 0～7：
+
+```bash
+python tests/clos/source/test_multi_buffer.py \
+    --api v2 --ep-size 64 --nnodes 8 --node-rank "$NODE_RANK" \
+    --dist-init-method "tcp://$MASTER_ADDR:$MASTER_PORT" \
+    --num-tokens 129 --small-tokens 17 --hidden 6144 --cycles 5 \
+    --allocate-on-comm-stream --expand
+```
+
 `Buffer/ElasticBuffer` 的普通 Runtime 接受 EP2/4/8/16/32/64/128/256/512。对称工作区至少 2 MiB，按 2 MiB 对齐，字节数不能超过 int64 上限；实际分配受设备内存和 SHMEM 地址空间限制。各 rank 的容量相同。**这是资源准入范围；算子的 EP、shape 和容量限制另见 Elastic 文档。**
 
 `ElasticBuffer` 使用 MTE+URMA Session。`num_bytes` 可显式指定；省略时由 HT size hint 计算，不能据此满足 LL 的固定 8 GiB 要求。Mesh+Clos 的 `Buffer` 使用 MTE 配置，要求显式进程组、`num_nvl_bytes` 和 `explicitly_destroy=True`，拒绝非零 `num_rdma_bytes`；资源构造不启用 V1 通信算法。Global Clos / Mesh+PCIe 的 V1 通信能力见机型后端说明。
