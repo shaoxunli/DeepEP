@@ -1,4 +1,5 @@
 #pragma once
+#include "device_simt/shmem_device_simt_context.h"
 
 #include "common/dispatch_output.h"
 #include "kernels/common/udma_shared_sender.h"
@@ -22,8 +23,9 @@ __simt_vf__ __launch_bounds__(1) inline void AdvanceDispatchEpoch(__gm__ uint64_
 
 __simt_vf__ __launch_bounds__(128) inline void PublishDispatchOutput(
     __gm__ uint8_t* control, uint32_t rank, uint32_t world, uint64_t epoch, uint64_t x, uint64_t scales, uint32_t rows,
-    uint32_t actual_rows, uint32_t x_bytes, uint32_t scale_bytes)
+    uint32_t actual_rows, uint32_t x_bytes, uint32_t scale_bytes, uint32_t instance_id)
 {
+    const simt::aclshmemx_instance_context_t ctx(instance_id);
     const uint64_t payload_bytes = uint64_t(rows) * x_bytes;
     const uint64_t scales_bytes = uint64_t(rows) * scale_bytes;
     if (actual_rows > rows || !x_bytes || (rows && !x) || (scales_bytes && !scales) || x > UINT64_MAX - payload_bytes ||
@@ -33,14 +35,14 @@ __simt_vf__ __launch_bounds__(128) inline void PublishDispatchOutput(
     }
     auto* slot = reinterpret_cast<__gm__ uint64_t*>(control + (uint64_t(rank) + 1U) * kOutputSlotBytes);
     for (uint32_t peer = threadIdx.x; peer < world; peer += 128U) {
-        simt::aclshmem_uint64_p(slot + 0, x, peer);
-        simt::aclshmem_uint64_p(slot + 1, scale_bytes ? scales : 0U, peer);
-        simt::aclshmem_uint64_p(slot + 2, rows, peer);
-        simt::aclshmem_uint64_p(slot + 3, x_bytes, peer);
-        simt::aclshmem_uint64_p(slot + 4, scale_bytes, peer);
+        ctx.p<uint64_t>(slot + 0, x, peer);
+        ctx.p<uint64_t>(slot + 1, scale_bytes ? scales : 0U, peer);
+        ctx.p<uint64_t>(slot + 2, rows, peer);
+        ctx.p<uint64_t>(slot + 3, x_bytes, peer);
+        ctx.p<uint64_t>(slot + 4, scale_bytes, peer);
         // Never assume the descriptor is atomically visible as one cache line.
         asc_threadfence();
-        simt::aclshmem_uint64_p(slot + kOutputEpochWord, epoch, peer);
+        ctx.p<uint64_t>(slot + kOutputEpochWord, epoch, peer);
         asc_threadfence();
     }
 }
@@ -50,7 +52,7 @@ __simt_vf__ __launch_bounds__(128) inline void PublishDispatchOutput(
 template <class Resource>
 __aicore__ inline void PrepareDispatchOutput(
     Resource& resource, uint64_t control, uint32_t rank, uint32_t world, GM_ADDR x, GM_ADDR scales, uint32_t rows,
-    uint32_t actual_rows, uint32_t x_bytes, uint32_t scale_bytes)
+    uint32_t actual_rows, uint32_t x_bytes, uint32_t scale_bytes, uint32_t instance_id)
 {
     auto epoch = resource.template GetBufferByByte<uint64_t>(0);
     asc_vf_call<AdvanceDispatchEpoch>(
@@ -60,7 +62,7 @@ __aicore__ inline void PrepareDispatchOutput(
     const uint64_t value = epoch.GetValue(0);
     asc_vf_call<PublishDispatchOutput>(
         dim3(128), reinterpret_cast<__gm__ uint8_t*>(control), rank, world, value, reinterpret_cast<uint64_t>(x),
-        reinterpret_cast<uint64_t>(scales), rows, actual_rows, x_bytes, scale_bytes);
+        reinterpret_cast<uint64_t>(scales), rows, actual_rows, x_bytes, scale_bytes, instance_id);
     AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
 }

@@ -1,4 +1,5 @@
 #pragma once
+#include "device_simt/shmem_device_simt_context.h"
 
 #include "kernels/common/udma_shared_sender.h"
 #include "common/types.h"
@@ -27,8 +28,9 @@ __aicore__ inline bool CombineSimtWeightsEnabled(const CombineTilingData& td)
 __simt_vf__ __launch_bounds__(128) inline void CombineWeightsVf(
     const __gm__ float* weights, const __gm__ int32_t* src_idx, __gm__ uint8_t* workspace,
     uint32_t row_begin, uint32_t row_end, uint32_t worker, uint32_t workers, uint32_t num_topk,
-    uint32_t rank, uint32_t peer, uint32_t capacity, uint64_t offset, uint32_t stride)
+    uint32_t rank, uint32_t peer, uint32_t capacity, uint64_t offset, uint32_t stride, uint32_t instance_id)
 {
+    const simt::aclshmemx_instance_context_t ctx(instance_id);
     constexpr uint32_t lanes = 8;
     for (uint64_t row = uint64_t(row_begin) + worker + uint64_t(threadIdx.x / lanes) * workers;
          row < row_end; row += uint64_t(workers) * (128U / lanes)) {
@@ -40,7 +42,7 @@ __simt_vf__ __launch_bounds__(128) inline void CombineWeightsVf(
         const uint64_t slot = uint64_t(rank) * capacity + uint32_t(token);
         auto* dst = reinterpret_cast<__gm__ float*>(workspace + offset + slot * stride);
         for (uint32_t k = threadIdx.x % lanes; k < num_topk; k += lanes)
-            simt::aclshmem_float_p(dst + k, weights[row * num_topk + k], peer);
+            ctx.p<float>(dst + k, weights[row * num_topk + k], peer);
     }
     asc_threadfence();
 }
@@ -62,7 +64,7 @@ __aicore__ inline void CombineRemoteWeights(
         asc_vf_call<CombineWeightsVf>(dim3(128), reinterpret_cast<__gm__ float*>(weights),
             reinterpret_cast<__gm__ int32_t*>(src_idx), workspace, begin, end, worker, workers,
             td.num_topk, td.rank, peer, td.token_capacity, td.topk_weights_buffer_offset,
-            td.topk_weights_row_stride);
+            td.topk_weights_row_stride, td.instance_id);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
     }

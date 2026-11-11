@@ -95,6 +95,7 @@ struct alignas(8) DispatchTilingData {
     uint64_t v2_dst_slots;
     // Buffer-owned symmetric address mailbox; never part of a cached handle.
     uint64_t udma_output_control;
+    uint32_t instance_id = 0;
 };
 
 struct alignas(8) CombineTilingData {
@@ -133,6 +134,7 @@ struct alignas(8) CombineTilingData {
     uint32_t pipeline_topk;
     uint32_t udma_workers_per_peer = 1;
     uint32_t udma_qps_per_worker = 1;
+    uint32_t instance_id = 0;
 };
 
 struct alignas(8) ExpandTilingData {

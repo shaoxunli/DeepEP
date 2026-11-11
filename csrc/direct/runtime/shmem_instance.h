@@ -35,6 +35,10 @@ public:
     void Synchronize(aclrtStream stream) const;
     void Destroy();
 
+    uint32_t InstanceId() const
+    {
+        return instance_id_;
+    }
     uint64_t FftsAddr() const;
     bool Initialized() const;
     bool IsAvailable() const;
@@ -82,6 +86,7 @@ private:
     void DestroyImpl(bool synchronize);
     void DestroyNoThrow() noexcept;
 
+    uint32_t instance_id_ = 0;
     int rank_;
     int world_size_;
     uint64_t local_mem_size_;
