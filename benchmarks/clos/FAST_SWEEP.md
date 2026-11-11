@@ -1,5 +1,7 @@
 # Clos peer strategy sweep
 
+中文部署、启动、验收和结果提取步骤见 [EP128 单次初始化摸测交接](FAST_SWEEP_HANDOFF_ZH.md)。
+
 `bench_fast_sweep.py` is an experimental performance-only runner for EP64/128,
 with eight contiguous ranks per server. It skips numerical validation. Reports
 always contain `precision_checked: false`; a successful run is not a precision
