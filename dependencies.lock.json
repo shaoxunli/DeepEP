@@ -4,7 +4,7 @@
   "shmem": {
     "repository": "https://gitcode.com/lishaoxun/shmem",
     "ref": "refs/heads/multi-buffer-integration",
-    "revision": "af044e6d8d2027469c5397a17e223613d40a4714",
+    "revision": "81407bdd430a4be8ca726a3515620bd2c92194a5",
     "distribution": "pinned third-party/shmem submodule or external SDK; headers and library recorded by record_shmem_sdk.py",
     "header_sha256_lf": {
       "host/shmem_host_def.h": "659aaa719af9c38bafef72921a73cca325c3c30f0f43be30b6ba9f0535de6cf6",
