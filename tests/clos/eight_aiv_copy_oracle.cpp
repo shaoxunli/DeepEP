@@ -21,6 +21,10 @@ constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID6 = 6;
 constexpr uint32_t kHeadersOffset = kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t)), kOutputRecordBytes = 64;
 static unsigned list_loads;
 namespace AscendC {
+inline uint64_t GetSystemCycle()
+{
+    return 0;
+}
 enum class HardEvent { MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S };
 template <HardEvent>
 void SetFlag(int)
@@ -141,6 +145,21 @@ void WaitIncoming(GM_ADDR, const DispatchTilingData&, uint32_t, uint32_t, uint32
 }
 void aclshmemx_sync_vec_all() {}
 
+// This oracle exercises the default protocol. Device/protocol tests separately
+// exercise readiness, rather than treating CPU no-op fences as device proof.
+bool PeerReady(const DispatchTilingData& td, uint32_t, uint64_t)
+{
+    assert(!td.peer_epoch);
+    return true;
+}
+void PublishMetadataDone(const DispatchTilingData& td, uint32_t, uint32_t, AscendC::LocalTensor<uint64_t>)
+{
+    assert(!td.peer_epoch);
+}
+void WaitMetadataDone(const DispatchTilingData&, uint32_t, uint32_t)
+{
+    assert(false);
+}
 // PRODUCTION_FUNCTIONS
 
 void CheckCopyAndReduction()

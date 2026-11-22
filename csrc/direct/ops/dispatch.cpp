@@ -668,10 +668,24 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         (!host_poll || std::strcmp(host_poll, "1") == 0)) {
         tiling.notify_host_counts = reinterpret_cast<uint64_t>(shmem.PrepareNotifyHostCounts(1 + num_local_experts));
     }
+    if (shmem.PeerReadyEnabled()) {
+        TORCH_CHECK(use_udma && !tiling.udma_token_schedule && !capturing && !zero_copy &&
+                        x.scalar_type() == torch::kBFloat16 && !x_scales.has_value(),
+                    "peer-ready supports uncaptured, non-zero-copy BF16 peer UDMA only");
+        for (const auto& input : {c10::optional<torch::Tensor>(x), topk_weights, topk_idx}) {
+            if (!input.has_value() || input->numel() == 0) continue;
+            const auto address = reinterpret_cast<uintptr_t>(input->data_ptr());
+            TORCH_CHECK(address < workspace_base || address - workspace_base >= symmetric_buffer_bytes,
+                        "peer-ready does not accept workspace-backed inputs");
+        }
+        tiling.peer_epoch = shmem.NextPeerEpoch();
+        tiling.peer_control = shmem.PeerControl();
+        tiling.needs_notify_entry_barrier = 0;
+    }
     host_timing.Value(MappedCounts, tiling.notify_host_counts != 0);
     host_timing.Mark(NotifySubmitBegin);
     if (cached_mode) {
-        LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr());
+        if (!tiling.peer_epoch) LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr());
         if (rebuild_cached_plan)
             LaunchCachedDispatchPlanKernel(is_token_in_rank, *dispatch_plan, send_head, tiling, shmem.FftsAddr());
     } else {

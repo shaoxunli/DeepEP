@@ -197,7 +197,8 @@ public:
     __aicore__ void Publish(GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t worker = 0)
     {
         Flush();
-        Base::Publish(base, offset, rank, worker);
+        Base::Publish(base, offset, rank, worker, td_.peer_control, td_.peer_epoch, td_.world_size,
+                      td_.npu_timeout_cycles);
     }
 
 private:

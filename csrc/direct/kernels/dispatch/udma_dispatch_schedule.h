@@ -80,6 +80,8 @@ __aicore__ inline void DispatchRemoteImpl(
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
     const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
     const uint32_t fields = td.has_x_scales && scale_bytes && !td.packed_peer_scales ? 2U : 1U;
+    const uint64_t ready_started = AscendC::GetSystemCycle();
+    bool ready[Capacity]{};
     // Lanes own disjoint existing notify channels; destination row order is unchanged.
     for (uint32_t ch = core % td.udma_workers_per_peer; sender.Count() && ch < td.num_channels; ch += td.udma_workers_per_peer) {
         const uint32_t begin = ch * channel_tokens < td.num_tokens ? ch * channel_tokens : td.num_tokens;
@@ -130,7 +132,12 @@ __aicore__ inline void DispatchRemoteImpl(
                 }
             }
             while (remaining) {
+                const uint32_t before = remaining;
                 for (uint32_t p = 0; p < sender.Count(); ++p) {
+                    if (!ready[p]) {
+                        ready[p] = PeerReady(td, sender.Rank(p), ready_started);
+                        if (!ready[p]) continue;
+                    }
                     uint32_t visit = td.udma_wqes_per_visit;
                     if (cursor[p] < counts[p]) sender.BeginVisit(p);
                     while (visit && cursor[p] < counts[p]) {
@@ -148,6 +155,7 @@ __aicore__ inline void DispatchRemoteImpl(
                         visit -= count;
                     }
                 }
+                if (td.peer_epoch && before == remaining) sender.Flush();
             }
         }
     }
@@ -168,12 +176,16 @@ __aicore__ inline void DispatchRemoteImpl(
         }
     }
     sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
+    PublishMetadataDone(td, core, cores, resource.template GetBufferByByte<uint64_t>(0));
     WaitIncoming<true>(workspace, td, core, cores, td.udma_workers_per_peer * Qps);
     sender.Quiet();
     // SO markers cover payload only. Metadata AIVs can still be doing remote
     // SIMT stores on another rank; all ranks/cores must join before outputs are
     // read or the workspace is reused. The collective includes local sync.
-    aclshmemx_sync_vec_all();
+    if (td.peer_epoch)
+        WaitMetadataDone(td, core, cores);
+    else
+        aclshmemx_sync_vec_all();
 }
 template <class Resource>
 __aicore__ inline void DispatchRemote(

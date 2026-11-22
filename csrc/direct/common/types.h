@@ -50,6 +50,8 @@ struct alignas(8) DispatchLayoutTilingData {
 };
 
 struct alignas(8) DispatchTilingData {
+    uint64_t peer_control = 0;
+    uint64_t peer_epoch = 0;
     uint32_t rank;
     uint32_t world_size;
     uint32_t num_tokens;
@@ -116,6 +118,8 @@ struct alignas(8) DispatchTilingData {
 };
 
 struct alignas(8) CombineTilingData {
+    uint64_t peer_control = 0;
+    uint64_t peer_epoch = 0;
     uint32_t rank;
     uint32_t world_size;
     uint32_t num_tokens;

@@ -127,6 +127,8 @@ void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
     // Begin, which retains its control-header reset and synchronization.
     const char* profile_notify = std::getenv("DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY");
     const bool separate_notify = profile_notify && std::strcmp(profile_notify, "1") == 0;
+    TORCH_CHECK(!tiling.peer_epoch || !separate_notify,
+                "peer-ready profiling must not insert DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY");
     const bool has_udma_begin =
         use_udma && (phase == CombinePhase::Fused || phase == CombinePhase::Communication) && !separate_notify;
     if (!has_udma_begin && phase != CombinePhase::Reduction && phase != CombinePhase::Remaining) {

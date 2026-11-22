@@ -96,9 +96,12 @@ __aicore__ inline void V1CombineUdmaImpl(
     AscendC::DataCopyPadExtParams<float> float_pad_params{false, 0, 0, 0};
 
     if constexpr (DoCommunication && Phase == 1) {
-        ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
-            core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
-            tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
+        ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size, core_idx,
+                                   core_num, resource.template GetBufferByByte<uint64_t>(0),
+                                   tiling.udma_token_schedule
+                                       ? ascend_deepep::udma::TokenWorkers(core_num)
+                                       : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker,
+                                   tiling.peer_control, tiling.peer_epoch);
         if (tiling.udma_token_schedule) {
             ascend_deepep::udma::CombineTokenRemote<1>(resource, x, topk_weights, src_idx, rank_prefix_matrix,
                 channel_prefix_matrix, symmetric_buffer, tiling, core_idx);
@@ -110,8 +113,11 @@ __aicore__ inline void V1CombineUdmaImpl(
     if constexpr (DoCommunication && Phase != 1) {
         if constexpr (Phase == 0) {
             ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
-                core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
-                tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
+                                       core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
+                                       tiling.udma_token_schedule
+                                           ? ascend_deepep::udma::TokenWorkers(core_num)
+                                           : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker,
+                                       tiling.peer_control, tiling.peer_epoch);
         }
 
         if (!tiling.udma_self_copy_after_submit) {

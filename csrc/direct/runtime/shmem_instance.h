@@ -58,6 +58,16 @@ public:
         return instance_id_;
     }
     uint64_t FftsAddr() const;
+    void SetPeerControl(void* pointer)
+    {
+        peer_control_ = pointer;
+    }
+    uint64_t PeerControl() const
+    {
+        return reinterpret_cast<uint64_t>(peer_control_);
+    }
+    bool PeerReadyEnabled() const;
+    uint64_t NextPeerEpoch();
     bool Initialized() const;
     bool IsAvailable() const;
     int64_t Rank() const;
@@ -143,4 +153,6 @@ private:
     std::size_t notify_count_capacity_ = 0;
     bool notify_host_unavailable_ = false;
     bool notify_host_pending_ = false;
+    void* peer_control_ = nullptr;
+    uint64_t peer_epoch_ = 0;
 };

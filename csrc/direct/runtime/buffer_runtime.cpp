@@ -529,6 +529,9 @@ void BufferRuntime::AllocateCommMeta()
     }
     ASCEND_DEEPEP_CHECK_ACL(aclrtMemset(comm_meta_ptr_, kCommMetaBytes, 0, kCommMetaBytes));
     if (transport_ == "udma") {
+        // Fixed control area is disjoint from KernelWorkspace for ordinary Buffers.
+        TORCH_CHECK(uint64_t(num_ranks_) * 3U * 512U <= kCommMetaBytes, "peer control exceeds comm metadata");
+        if (num_bytes_ > 0) shmem_->SetPeerControl(comm_meta_ptr_);
         const auto bytes = ascend_deepep::udma::OutputControlBytes(static_cast<uint32_t>(num_ranks_));
         dispatch_output_control_ = aclshmem_malloc(bytes);
         TORCH_CHECK(dispatch_output_control_ != nullptr, "aclshmem_malloc failed for dispatch output addresses");
@@ -569,6 +572,7 @@ void BufferRuntime::FreeResources()
             aclshmem_free(dispatch_output_control_);
             dispatch_output_control_ = nullptr;
         }
+        shmem_->SetPeerControl(nullptr);
         aclshmem_free(comm_meta_ptr_);
         comm_meta_ptr_ = nullptr;
     }

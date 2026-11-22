@@ -56,17 +56,27 @@ __aicore__ inline void CombineRemoteWeights(
     const uint32_t worker = core - first, workers = td.block_dim - first;
     AscendC::GlobalTensor<int32_t> ranks;
     ranks.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
-    for (uint32_t peer = 0; peer < td.world_size; ++peer) {
-        if (peer == td.rank) continue; // Existing local-copy path owns self.
-        const uint32_t begin = peer ? ranks.GetValue((peer - 1U) * td.world_size + td.rank) : 0;
-        const uint32_t end = ranks.GetValue(peer * td.world_size + td.rank);
-        if (uint64_t(begin) + worker >= end) continue;
-        asc_vf_call<CombineWeightsVf>(dim3(128), reinterpret_cast<__gm__ float*>(weights),
-            reinterpret_cast<__gm__ int32_t*>(src_idx), workspace, begin, end, worker, workers,
-            td.num_topk, td.rank, peer, td.token_capacity, td.topk_weights_buffer_offset,
-            td.topk_weights_row_stride, td.instance_id);
-        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+    uint64_t emitted[16]{};
+    uint32_t left = td.world_size;
+    const uint64_t started = AscendC::GetSystemCycle();
+    while (left) {
+        for (uint32_t peer = 0; peer < td.world_size; ++peer) {
+            const uint64_t bit = uint64_t(1) << (peer % 64);
+            if (emitted[peer / 64] & bit) continue;
+            if (!PeerReady(td, peer, started)) continue;
+            emitted[peer / 64] |= bit;
+            --left;
+            if (peer == td.rank) continue;  // Existing local-copy path owns self.
+            const uint32_t begin = peer ? ranks.GetValue((peer - 1U) * td.world_size + td.rank) : 0;
+            const uint32_t end = ranks.GetValue(peer * td.world_size + td.rank);
+            if (uint64_t(begin) + worker >= end) continue;
+            asc_vf_call<CombineWeightsVf>(dim3(128), reinterpret_cast<__gm__ float*>(weights),
+                                          reinterpret_cast<__gm__ int32_t*>(src_idx), workspace, begin, end, worker,
+                                          workers, td.num_topk, td.rank, peer, td.token_capacity,
+                                          td.topk_weights_buffer_offset, td.topk_weights_row_stride, td.instance_id);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        }
     }
 }
 #endif

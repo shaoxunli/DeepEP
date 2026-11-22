@@ -132,9 +132,11 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     }
     // Clears incoming payload markers and publishes this invocation's output
     // addresses/top-k initialization before remote writes. Every AIV participates.
-    ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
-        core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
-        tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
+    ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size, core_idx,
+                               core_num, resource.template GetBufferByByte<uint64_t>(0),
+                               tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num)
+                                                          : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker,
+                               tiling.peer_control, tiling.peer_epoch);
 
     if (overlap_scales) {
         const uint32_t first = ascend_deepep::udma::MetadataFirst(world_size, tiling.udma_peers_per_worker,

@@ -46,8 +46,15 @@ __aicore__ inline void CombineRemoteImpl(
         end[p] = begin + uint64_t(length) * (lane + 1U) / td.udma_workers_per_peer;
         remaining += end[p] - row[p];
     }
+    const uint64_t ready_started = AscendC::GetSystemCycle();
+    bool ready[Capacity]{};
     while (remaining) {
+        const uint32_t before = remaining;
         for (uint32_t p = 0; p < sender.Count(); ++p) {
+            if (!ready[p]) {
+                ready[p] = PeerReady(td, sender.Rank(p), ready_started);
+                if (!ready[p]) continue;
+            }
             uint32_t visit = td.udma_wqes_per_visit;
             if (row[p] < end[p]) sender.BeginVisit(p);
             while (visit && row[p] < end[p]) {
@@ -95,6 +102,7 @@ __aicore__ inline void CombineRemoteImpl(
                 visit -= count;
             }
         }
+        if (td.peer_epoch && before == remaining) sender.Flush();
     }
     if constexpr (Phase == 1) {
         sender.Flush(); // Drain WQE staging, not the asynchronous payload reads.
@@ -116,11 +124,14 @@ __aicore__ inline void CombineRemoteImpl(
                 CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
             }
         }
+        PublishMetadataDone(td, core, td.block_dim, resource.template GetBufferByByte<uint64_t>(0));
         WaitIncoming<false>(workspace, td, core, td.block_dim, td.udma_workers_per_peer * Qps);
         sender.Quiet();
         // UDMA SO markers do not cover SIMT stores issued by other AIVs.
         // Match Dispatch's full-rank completion before Reduce/workspace reuse.
-        if (simt_weights)
+        if (td.peer_epoch)
+            WaitMetadataDone(td, core, td.block_dim);
+        else if (simt_weights)
             aclshmemx_sync_vec_all();
         else
             AscendC::SyncAll<true>();

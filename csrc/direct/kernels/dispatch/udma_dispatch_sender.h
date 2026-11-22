@@ -66,13 +66,13 @@ class DispatchSenderT : public SenderT<Capacity, Qps> {
     static constexpr uint32_t kDispatchBasesOffset = kHeadersOffset + Capacity * Qps * 2U * kWqeBytes;
     static constexpr uint32_t kDispatchEpochOffset = kDispatchBasesOffset + Capacity * Qps * kOutputRecordBytes;
 public:
-    __aicore__ DispatchSenderT(
-        const DispatchTilingData& td, uint32_t core, AscendC::LocalTensor<uint8_t> scratch, GM_ADDR workspace, GM_ADDR x,
-        GM_ADDR scales, uint32_t peer_start = UINT32_MAX, uint32_t rotation = 0)
-        : Base(td.rank, td.world_size, core,
-              peer_start == UINT32_MAX ? td.udma_peers_per_worker : kMaxPeers,
-              reinterpret_cast<__ubuf__ uint8_t*>(scratch.GetPhyAddr()), workspace, peer_start, rotation, td.udma_peer_order, td.udma_ranks_per_group,
-              peer_start == UINT32_MAX ? td.udma_workers_per_peer : 1U),
+    __aicore__ DispatchSenderT(const DispatchTilingData& td, uint32_t core, AscendC::LocalTensor<uint8_t> scratch,
+                               GM_ADDR workspace, GM_ADDR x, GM_ADDR scales, uint32_t peer_start = UINT32_MAX,
+                               uint32_t rotation = 0)
+        : Base(td.rank, td.world_size, core, peer_start == UINT32_MAX ? td.udma_peers_per_worker : kMaxPeers,
+               reinterpret_cast<__ubuf__ uint8_t*>(scratch.GetPhyAddr()), workspace, peer_start, rotation,
+               td.udma_peer_order, td.udma_ranks_per_group, peer_start == UINT32_MAX ? td.udma_workers_per_peer : 1U),
+          scratch_tensor_(scratch),
           td_(td),
           x_(reinterpret_cast<uint64_t>(x)),
           scales_(reinterpret_cast<uint64_t>(scales))
@@ -90,8 +90,7 @@ public:
                 }
             return;
         }
-        if (count_ == 0)
-            return;
+        if (count_ == 0 || td.peer_epoch) return;
         AscendC::GlobalTensor<uint8_t> control;
         control.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(td.udma_output_control));
         AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
@@ -178,8 +177,41 @@ public:
 
     // One visit is at most udma_wqes_per_visit WQEs for one peer.
     // Baseline Qps=1 keeps its original batching, with no extra flush.
+    __aicore__ void LoadReadyOutput(uint32_t p)
+    {
+        if (!td_.peer_epoch || !td_.udma_output_control || loaded_output_[p]) return;
+        // Scheduler checked this peer's local ready notification. Other peer
+        // descriptors may still be old: do not fetch them in the constructor.
+        AscendC::GlobalTensor<uint8_t> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(td_.udma_output_control));
+        auto ub = scratch_tensor_;
+        AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+        AscendC::DataCopyPad(ub[kDispatchEpochOffset], gm, AscendC::DataCopyExtParams{1, 32, 0, 0, 0},
+                             AscendC::DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
+        for (uint32_t lane = 0; lane < Qps; ++lane)
+            AscendC::DataCopyPad(ub[kDispatchBasesOffset + (lane * Capacity + p) * kOutputRecordBytes],
+                                 gm[OutputRecordOffset(peers_[lane * Capacity + p].peer)],
+                                 AscendC::DataCopyExtParams{1, kOutputRecordBytes, 0, 0, 0},
+                                 AscendC::DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+        const uint64_t epoch = *reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchEpochOffset);
+        for (uint32_t lane = 0; lane < Qps; ++lane) {
+            auto* out = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset) +
+                        (lane * Capacity + p) * kOutputRecordWords;
+            if (!epoch || out[kOutputEpochWord] != epoch || out[2] > UINT32_MAX ||
+                out[3] != uint64_t(td_.hidden) * td_.x_element_bytes || out[4] != 0 || (out[2] && !out[0]) ||
+                out[0] > UINT64_MAX - out[2] * out[3]) {
+                trap();
+                return;
+            }
+        }
+        loaded_output_[p] = true;
+    }
     __aicore__ void BeginVisit(uint32_t p)
     {
+        LoadReadyOutput(p);
         if constexpr (Qps == 2) {
             Flush();
             Base::SelectQp(next_qp_[p]);
@@ -215,10 +247,13 @@ public:
     __aicore__ void Publish(GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t worker = 0)
     {
         Flush();
-        Base::Publish(base, offset, rank, worker);
+        Base::Publish(base, offset, rank, worker, td_.peer_control, td_.peer_epoch, td_.world_size,
+                      td_.npu_timeout_cycles);
     }
 
 private:
+    AscendC::LocalTensor<uint8_t> scratch_tensor_;
+    bool loaded_output_[Capacity]{};
     const DispatchTilingData& td_;
     uint64_t x_, scales_;
     uint32_t rows_pending_ = 0, spans_ = 0;

@@ -19,6 +19,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("get_shmem_unique_id", &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);
     m.attr("fused_layout_notify_version") = 1;
+    m.attr("peer_ready_protocol_version") = 1;
     m.attr("fused_notify_pipeline_version") = 1;
     m.def("begin_dispatch_host_timing", &ascend_deepep::ops::BeginDispatchHostTiming);
     m.def("end_dispatch_host_timing",

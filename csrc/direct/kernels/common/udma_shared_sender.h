@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernel_operator.h"
+#include "kernels/common/peer_ready.h"
 #include "shmem.h"
 #include "simt_api/device_sync_functions.h"
 #define ASCEND_DEEPEP_DEVICE_SCHEDULE
@@ -32,11 +33,29 @@ __aicore__ inline __gm__ uint64_t* Signal(GM_ADDR base, uint64_t offset, uint32_
 // operation has released this rank's outgoing marker source. When Begin is the
 // only entry barrier (ordinary combine), no payload writes may precede it.
 // Dispatch's pre-Begin scale packing/top-k initialization still needs notify.
-__aicore__ inline void Begin(
-    GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t world, uint32_t core, uint32_t cores,
-    AscendC::LocalTensor<uint64_t> scratch, uint32_t marker_count = 1)
+__aicore__ inline void Begin(GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t world, uint32_t core,
+                             uint32_t cores, AscendC::LocalTensor<uint64_t> scratch, uint32_t marker_count = 1,
+                             uint64_t control = 0, uint64_t epoch = 0)
 {
     if (marker_count > kSignalBytes / sizeof(uint64_t)) { trap(); return; }
+    if (epoch) {
+        if (core == 0) {
+            for (uint32_t i = 0; i < marker_count; ++i) scratch.SetValue(i, epoch);
+            AscendC::GlobalTensor<uint64_t> own;
+            own.SetGlobalBuffer(PeerSlot(control, world, 2, rank));
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID4);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID4);
+            AscendC::DataCopyPad(own, scratch, AscendC::DataCopyExtParams{1, marker_count * 8U, 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
+        }
+        // Includes output-descriptor SIMT writes issued before Begin.
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::ALL>();
+        AscendC::SyncAll<true>();
+        PushPeerEpoch(control, world, 0, rank, core, cores, epoch, scratch);
+        return;
+    }
+
     for (uint32_t source = core; source < world; source += cores) {
         for (uint32_t worker = 0; worker < marker_count; ++worker)
             scratch.SetValue(worker, source == rank ? 1U : 0U);
@@ -185,12 +204,20 @@ public:
         // SDK MTE3_S completion drains WQE reads before scratch/requests reuse.
         pending_ = 0;
     }
-    __aicore__ void Publish(GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t worker = 0)
+    __aicore__ void Publish(GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t worker = 0, uint64_t control = 0,
+                            uint64_t epoch = 0, uint32_t world = 0, uint64_t timeout = 0)
     {
         Flush();
         for (uint32_t lane = 0; lane < Qps; ++lane) {
-            auto* one = Signal(base, offset, rank) + worker * Qps + lane;
+            auto* one = (epoch ? PeerSlot(control, world, 2, rank) : Signal(base, offset, rank)) + worker * Qps + lane;
             for (uint32_t p = 0; p < count_; ++p) {
+                if (epoch) {
+                    struct Ready {
+                        uint64_t peer_control, peer_epoch, npu_timeout_cycles;
+                        uint32_t rank, world_size;
+                    };
+                    WaitPeerReady(Ready{control, epoch, timeout, rank, world}, peers_[lane * Capacity + p].peer);
+                }
                 aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kDone>(
                     one, one, reinterpret_cast<__ubuf__ uint64_t*>(scratch_), 1U,
                     peers_[lane * Capacity + p].peer, qp_base_ + lane, EVENT_ID5);
@@ -236,14 +263,15 @@ __aicore__ inline void WaitIncoming(
         const uint32_t worker = item % marker_count;
         if (source == td.rank)
             continue;
-        auto* address = Signal(base, td.udma_completion_signal_offset, source) + worker;
+        auto* address = (td.peer_epoch ? PeerSlot(td.peer_control, td.world_size, 2, source)
+                                       : Signal(base, td.udma_completion_signal_offset, source)) +
+                        worker;
         AscendC::GlobalTensor<uint64_t> signal;
         signal.SetGlobalBuffer(address);
         while (true) {
             dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(address));
             const uint64_t value = signal.GetValue(0);
-            if (value == 1U)
-                break;
+            if (value == (td.peer_epoch ? td.peer_epoch : 1U)) break;
             const uint64_t elapsed = static_cast<uint64_t>(AscendC::GetSystemCycle()) - start;
             if (elapsed >= td.npu_timeout_cycles) {
                 const auto elapsed_us = static_cast<unsigned long long>(elapsed / kNpuSystemCyclesPerUs);
@@ -252,18 +280,19 @@ __aicore__ inline void WaitIncoming(
                     AscendC::printf(
                         "[V1_UDMA_TIMEOUT] op=dispatch stage=wait_incoming rank=%u aiv_core_idx=%u "
                         "peer_rank=%u worker_idx=%u instance_id=%u cached=%u "
-                        "signal=0x%llx expected=1 observed=%llu elapsed_us=%llu timeout_s=%u\n",
+                        "signal=0x%llx expected=%llu observed=%llu elapsed_us=%llu timeout_s=%u\n",
                         td.rank, core, source, worker, td.instance_id, td.cached_mode,
-                        reinterpret_cast<unsigned long long>(address), static_cast<unsigned long long>(value),
-                        elapsed_us, timeout_s);
+                        reinterpret_cast<unsigned long long>(address),
+                        static_cast<unsigned long long>(td.peer_epoch ? td.peer_epoch : 1U),
+                        static_cast<unsigned long long>(value), elapsed_us, timeout_s);
                 } else {
                     AscendC::printf(
                         "[V1_UDMA_TIMEOUT] op=combine stage=wait_incoming rank=%u aiv_core_idx=%u "
                         "peer_rank=%u worker_idx=%u instance_id=%u "
-                        "signal=0x%llx expected=1 observed=%llu elapsed_us=%llu timeout_s=%u\n",
-                        td.rank, core, source, worker, td.instance_id,
-                        reinterpret_cast<unsigned long long>(address), static_cast<unsigned long long>(value),
-                        elapsed_us, timeout_s);
+                        "signal=0x%llx expected=%llu observed=%llu elapsed_us=%llu timeout_s=%u\n",
+                        td.rank, core, source, worker, td.instance_id, reinterpret_cast<unsigned long long>(address),
+                        static_cast<unsigned long long>(td.peer_epoch ? td.peer_epoch : 1U),
+                        static_cast<unsigned long long>(value), elapsed_us, timeout_s);
                 }
                 // Fail the device task. Returning normally would strand other
                 // AIVs at SyncAll or expose incomplete payload as valid output.

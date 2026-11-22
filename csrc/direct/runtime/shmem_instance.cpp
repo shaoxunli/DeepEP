@@ -22,6 +22,24 @@
 #include "common/check.h"
 #include "common/types.h"
 
+bool ShmemInstance::PeerReadyEnabled() const
+{
+    const char* value = std::getenv("DEEPEP_CLOS_PEER_READY");
+    TORCH_CHECK(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0,
+                "DEEPEP_CLOS_PEER_READY must be 0 or 1");
+    if (!value || value[0] == '0') return false;
+    TORCH_CHECK(peer_control_, "peer-ready requires a Buffer-owned control region");
+    TORCH_CHECK(world_size_ > 0 && world_size_ <= 1024, "peer-ready supports at most 1024 ranks");
+    return true;
+}
+
+uint64_t ShmemInstance::NextPeerEpoch()
+{
+    TORCH_CHECK(PeerReadyEnabled(), "peer-ready must be enabled before reserving an epoch");
+    TORCH_CHECK(peer_epoch_ < uint64_t(INT64_MAX), "peer-ready epoch exhausted");
+    return ++peer_epoch_;
+}
+
 namespace {
 
 constexpr uint64_t kDeviceLargePageBytes = 2ULL * 1024ULL * 1024ULL;

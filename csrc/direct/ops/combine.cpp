@@ -9,6 +9,7 @@
 #include "common/platform.h"
 #include "common/udma_schedule.h"
 #include "ops/launcher.h"
+#include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "runtime/buffer_runtime.h"
 #include "ops/stream_allocator.h"
 #include "runtime/shmem_instance.h"
@@ -404,6 +405,21 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
             pipeline_ready ? (reinterpret_cast<uint64_t>(pipeline_ready->data_ptr()) + 511U) / 512U * 512U : 0;
         tiling.pipeline_chunk_tokens = static_cast<uint32_t>(pipeline_chunk_tokens);
         tiling.pipeline_topk = static_cast<uint32_t>(pipeline_mapping->size(1));
+    }
+    if (shmem.PeerReadyEnabled()) {
+        TORCH_CHECK(c10_npu::currentStreamCaptureStatusMayInitCtx() == c10_npu::CaptureStatus::None && use_udma &&
+                        !tiling.udma_token_schedule && !aggregate && !pipeline_chunk_tokens &&
+                        !expanded_x.has_value() && x.scalar_type() == torch::kBFloat16,
+                    "peer-ready supports ordinary BF16 peer combine only");
+        const auto workspace_base = reinterpret_cast<uintptr_t>(symmetric_buffer);
+        for (const auto& input : {c10::optional<torch::Tensor>(x), topk_weights}) {
+            if (!input.has_value() || input->numel() == 0) continue;
+            const auto address = reinterpret_cast<uintptr_t>(input->data_ptr());
+            TORCH_CHECK(address < workspace_base || address - workspace_base >= symmetric_buffer_bytes,
+                        "peer-ready does not accept workspace-backed inputs");
+        }
+        tiling.peer_epoch = shmem.NextPeerEpoch();
+        tiling.peer_control = shmem.PeerControl();
     }
     const auto ffts_addr = shmem.FftsAddr();
     // Capture the prepared tensors/tiling by value once; no recomputation or
