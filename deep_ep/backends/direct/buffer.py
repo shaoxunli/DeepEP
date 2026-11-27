@@ -9,6 +9,7 @@ from threading import RLock
 from typing import Any, List, Optional, Tuple, Union
 
 from deep_ep._backend_lock import LOCK as _BOOTSTRAP_LOCK
+from deep_ep.utils.api_statistics import initialize_api_statistics, record_api
 
 from ._native import get_native_class, load_native_module
 from .config import Config, _MAX_NUM_AIV
@@ -242,6 +243,7 @@ class Buffer:
         # session. The native runtime owns the symmetric workspace itself.
         self._slot = Slot(0, owner=self, native_resources=self._native)
         self._communication_stream = get_global_comm_stream()
+        initialize_api_statistics()
 
     @property
     def udma_auto_policy(self):
@@ -417,6 +419,7 @@ class Buffer:
             raise
         return EventOverlap()
 
+    @record_api("get_dispatch_layout")
     def get_dispatch_layout(
         self,
         topk_idx: Any,
@@ -462,6 +465,7 @@ class Buffer:
             event,
         )
 
+    @record_api("intranode_dispatch")
     def dispatch(
         self,
         x: Union[Any, Tuple[Any, Any]],
@@ -679,6 +683,7 @@ class Buffer:
             event,
         )
 
+    @record_api("intranode_combine")
     def combine(
         self,
         x: Any,
