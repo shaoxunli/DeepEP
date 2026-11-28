@@ -15,10 +15,13 @@ def public_runtime(monkeypatch):
     from deep_ep.backends import mesh_pcie as _card_adapter
     from deep_ep import buffer as legacy
     from deep_ep.buffers import elastic
+    from deep_ep.backends.direct import _native as direct_native
     from deep_ep.backends.direct import buffer as source_v1, elastic as source_v2
+    from deep_ep.utils import kernel_trace
 
     calls = []
     group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+    trace_native = object()
 
     def gather(_, record):
         return [record, record]
@@ -49,7 +52,17 @@ def public_runtime(monkeypatch):
             assert kwargs["udma_auto_options"][0] == "clos-v4"
         return [], "test"
 
+    def attach_trace_session(native, trace_group, rank, ep_size, all_gather, *, comm=None):
+        assert native is trace_native
+        assert trace_group is group and rank == 0 and ep_size == 2 and comm is None
+        assert all_gather is source_v1._bootstrap_all_gather
+        calls.append(("trace",))
+        return None, None
+
     monkeypatch.setattr(source_v1, "_is_capturing", lambda: False)
+    monkeypatch.setattr(source_v1, "load_native_module", lambda: trace_native)
+    monkeypatch.setattr(direct_native, "load_native_module", lambda: trace_native)
+    monkeypatch.setattr(kernel_trace, "attach_trace_session", attach_trace_session)
     for module in (source_v1, source_v2):
         monkeypatch.setattr(module, "get_native_class", lambda _: Native)
         monkeypatch.setattr(module, "_prepare_shmem_bootstrap", bootstrap)
@@ -94,6 +107,7 @@ def test_machine_fixes_engine_before_bootstrap(
             [("bootstrap", engine), ("native", engine)]
             + ([("mapping",)] if machine == "mesh_pcie" else [])
             + ([("barrier",)] if api == "ElasticBuffer" else [])
+            + ([("trace",)] if machine == "global_clos" else [])
         )
     finally:
         # CPU doubles own no native resources.

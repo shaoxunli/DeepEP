@@ -48,6 +48,18 @@ METADATA = dict(
 )
 
 
+def _link_profile_task(events, name, host, device, task):
+    key = len(events)
+    events.extend(
+        [
+            dict(name=name, ph="X", ts=host, dur=4, pid=1, tid=1),
+            dict(name="torch_to_npu", ph="s", ts=host + 1, pid=1, tid=1, cat="flow", id=key),
+            dict(name="torch_to_npu", ph="f", ts=device, pid=2, tid=1, cat="flow", id=key),
+            dict(name=task, ph="X", ts=device, dur=3, pid=2, tid=1),
+        ]
+    )
+
+
 @pytest.mark.parametrize("op", ["dispatch", "cached-dispatch", "combine_unweighted", "combine_weighted"])
 @pytest.mark.parametrize("flush", [False, True])
 @pytest.mark.parametrize("barrier", ["_Z24barrier_on_stream_kernelim", "cached_notify_combine_kernel"])
@@ -67,30 +79,19 @@ def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush
         + ["v1_dispatch_udma_kernel"]
     )
 
-    def linked(name, host, device, task):
-        key = len(events)
-        events.extend(
-            [
-                dict(name=name, ph="X", ts=host, dur=4, pid=1, tid=1),
-                dict(name="torch_to_npu", ph="s", ts=host + 1, pid=1, tid=1, cat="flow", id=key),
-                dict(name="torch_to_npu", ph="f", ts=device, pid=2, tid=1, cat="flow", id=key),
-                dict(name=task, ph="X", ts=device, dur=3, pid=2, tid=1),
-            ]
-        )
-
     # Include a preceding guard flush, so sample zero must select the nearest
     # flush instead of accidentally consuming warmup/guard data.
     for sample in (-1, 0, 1):
         host, device = 200 + sample * 100, 2000 + sample * 100
         if flush:
-            linked(L2_FLUSH_RANGE, host, device, "InplaceZero")
+            _link_profile_task(events, L2_FLUSH_RANGE, host, device, "InplaceZero")
             rows.append(dict(zip(columns, ("InplaceZero", device, 3, 0, 1, 32))))
         rows.append(dict(zip(columns, (barrier, device + 10, 5, 0, 1, 1))))
         if sample < 0:
-            linked(f"{PROFILE_SAMPLE_RANGE}{sample}/end", host + 80, device + 80, "EVENT RECORD")
+            _link_profile_task(events, f"{PROFILE_SAMPLE_RANGE}{sample}/end", host + 80, device + 80, "EVENT RECORD")
             continue
-        linked(f"{PROFILE_SAMPLE_RANGE}{sample}/start", host + 20, device + 20, "EVENT RECORD")
-        linked(f"{PROFILE_SAMPLE_RANGE}{sample}/end", host + 80, device + 80, "EVENT RECORD")
+        _link_profile_task(events, f"{PROFILE_SAMPLE_RANGE}{sample}/start", host + 20, device + 20, "EVENT RECORD")
+        _link_profile_task(events, f"{PROFILE_SAMPLE_RANGE}{sample}/end", host + 80, device + 80, "EVENT RECORD")
         rows.extend(dict(zip(columns, (name, device + 30 + i * 10, 3, 0, 1, 32))) for i, name in enumerate(names))
     (tmp_path / "profiler_info_0.json").write_text("{}")
 
@@ -132,6 +133,52 @@ def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush
             ]
             with pytest.raises(ValueError, match="missing/ambiguous pre-sample L2 flush"):
                 parse()
+
+
+def test_clos_v1_instance_barrier_is_excluded_only_in_combine_gaps(tmp_path):
+    from benchmarks.clos.stage_metrics import PROFILE_SAMPLE_RANGE, parse_profile
+
+    events, rows = [], []
+    columns = ["Name", "Start Time(us)", "Duration(us)", "Device_id", "Step Id", "Block Num"]
+    barrier = "deepep_instance_sync_kernel"
+    names = ["cached_notify_combine_kernel", "v1_combine_udma_kernel", barrier]
+    for sample in range(2):
+        host, device = 200 + sample * 100, 2000 + sample * 100
+        _link_profile_task(events, f"{PROFILE_SAMPLE_RANGE}{sample}/start", host + 20, device + 20, "EVENT RECORD")
+        _link_profile_task(events, f"{PROFILE_SAMPLE_RANGE}{sample}/end", host + 80, device + 80, "EVENT RECORD")
+        rows.extend(
+            dict(zip(columns, (name, device + 30 + i * 10, 3, 4, 1, 1 if name == barrier else 32)))
+            for i, name in enumerate(names)
+        )
+    gap = dict(zip(columns, (barrier, 2090, 3, 4, 1, 1)))
+    rows.append(gap)
+    (tmp_path / "profiler_info_0.json").write_text("{}")
+    (tmp_path / "trace_view.json").write_text(json.dumps(events))
+
+    def parse(api="v1", op="combine_unweighted"):
+        with (tmp_path / "kernel_details.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
+        return parse_profile(tmp_path, op, False, 2, 4, 32, api=api, sample_markers=True)
+
+    result = parse()
+    assert result["kernel_sequence"] == names
+    assert all(sample["fused_combine_us"] == sample["notify_us"] == sample["other_us"] == "3"
+               for sample in result["samples"])
+    with pytest.raises(ValueError, match="unassigned kernel"):
+        parse(api="v2")
+    with pytest.raises(ValueError, match="unassigned kernel"):
+        parse(op="dispatch")
+    for column, invalid in (("Name", "unexpected_kernel"), ("Block Num", 2), ("Device_id", 5), ("Step Id", 0)):
+        original = gap[column]
+        gap[column] = invalid
+        with pytest.raises(ValueError, match="unassigned kernel"):
+            parse()
+        gap[column] = original
+    gap["Start Time(us)"] = 2079
+    with pytest.raises(ValueError, match="kernel crosses sample boundary"):
+        parse()
 
 
 @pytest.mark.parametrize("enabled", [False, True])

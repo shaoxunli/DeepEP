@@ -1,16 +1,20 @@
 #include "runtime/kernel_trace.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <unistd.h>
 
 #include "common/kernel_trace_layout.h"
@@ -20,6 +24,15 @@
 namespace ascend_deepep::trace {
 namespace {
 constexpr size_t kSlotBytes = platform::kMaxNumAiv * kCoreBytes;
+constexpr int64_t kNsPerMs = 1'000'000;
+constexpr std::array<std::string_view, KernelOpCounters::kCount> kRecorderKernelNames{
+    "notify_dispatch_kernel", "cached_notify_dispatch_kernel", "v1_dispatch_udma_kernel",
+    "cached_notify_combine_kernel", "v1_combine_udma_kernel", "v1_combine_udma_comm_kernel",
+    "v1_combine_udma_reduce_kernel", "v1_combine_udma_early_kernel", "v1_combine_udma_remaining_kernel",
+    "v1_combine_udma_pipeline_kernel",
+};
+enum class TraceMode { Recorder, Test, TestMetadataOnly };
+std::atomic<TraceMode> trace_mode{TraceMode::Recorder};
 std::atomic<uint64_t> next_sequence{1};
 thread_local TraceMetadataSnapshot active_metadata;
 struct NotifyProbeMemory {
@@ -60,6 +73,18 @@ void Check(aclError status, const char* op)
 {
     if (status != ACL_SUCCESS) throw std::runtime_error(std::string(op) + ": " + std::to_string(status));
 }
+
+int ReadRecorderMilliseconds(const char* name, int fallback)
+{
+    const char* value = std::getenv(name);
+    if (!value || !*value) return fallback;
+    const char* end = value + std::strlen(value);
+    int milliseconds = 0;
+    const auto parsed = std::from_chars(value, end, milliseconds);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || milliseconds <= 0)
+        throw std::invalid_argument(std::string(name) + " must be a positive integer in milliseconds");
+    return milliseconds;
+}
 }  // namespace
 
 namespace {
@@ -73,6 +98,101 @@ void JsonString(std::string& out, const std::string& value)
         else out += ch; // Preserve UTF-8; the Python file is opened with encoding="utf-8".
     }
     out += '"';
+}
+
+std::optional<uint64_t> ParseUnsigned(std::string_view text)
+{
+    if (text.empty()) return std::nullopt;
+    uint64_t value{};
+    const auto end = text.data() + text.size();
+    const auto parsed = std::from_chars(text.data(), end, value);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) return std::nullopt;
+    return value;
+}
+
+bool IsCanonicalCommId(std::string_view comm_id)
+{
+    return !comm_id.empty() && (comm_id.size() == 1 || comm_id.front() != '0') &&
+           ParseUnsigned(comm_id).has_value();
+}
+
+std::string ProductionWallTime(int64_t ns)
+{
+    constexpr int64_t kNsPerSecond = 1'000'000'000;
+    constexpr int64_t kUtcOffsetSeconds = 8 * 3600;
+    auto seconds = ns / kNsPerSecond;
+    auto fraction = ns % kNsPerSecond;
+    if (fraction < 0) {
+        --seconds;
+        fraction += kNsPerSecond;
+    }
+    const auto timestamp = static_cast<std::time_t>(seconds + kUtcOffsetSeconds);
+    std::tm calendar{};
+    char result[32]{};
+    if (!gmtime_r(&timestamp, &calendar)) throw std::runtime_error("cannot convert trace wall time");
+    const auto size = std::strftime(result, sizeof(result), "%Y-%m-%d %H:%M:%S", &calendar);
+    if (!size) throw std::runtime_error("cannot format trace wall time");
+    std::snprintf(result + size, sizeof(result) - size, ".%06d", static_cast<int>(fraction / 1000));
+    return std::string("\"") + result + '"';
+}
+
+void AppendProductionRecord(std::string& jsonl, const TraceRecord& record, std::string_view comm_id, uint32_t bus_id)
+{
+    const auto value = [&](const char* name) -> std::optional<int64_t> {
+        const auto it = record.values.find(name);
+        if (it == record.values.end()) return std::nullopt;
+        return it->second;
+    };
+    const bool completed = record.event == "end";
+    jsonl += "{\"type\":";
+    jsonl += completed ? '2' : '1';
+    const auto field = [&](const char* name, std::string_view json) {
+        jsonl += ",\"";
+        jsonl += name;
+        jsonl += "\":";
+        jsonl += json;
+    };
+    const auto number = [&](const char* name, std::optional<int64_t> n) {
+        if (n) field(name, std::to_string(*n));
+        else field(name, "null");
+    };
+    const auto time = [&](const char* name, std::optional<int64_t> ns) {
+        if (ns) field(name, ProductionWallTime(*ns));
+        else field(name, "null");
+    };
+
+    const auto op = value("op");
+    const bool short_format = op == 0 || op == 1 || op == 3 || op == 6;
+    number("gid", value("gid"));
+    number("op", op);
+    number("op_count", value("op_count"));
+    number("dispatch_count", value("dispatch_count"));
+    if (!short_format) number("ep_size", value("ep_size"));
+    number("bus_id", bus_id);
+    const auto rank = value("rank");
+    number("rank", rank);
+    number("nvl_rank", rank ? std::optional<int64_t>{*rank % 16} : std::nullopt);
+    if (!short_format) {
+        number("hidden_size", value("hidden_size"));
+        number("num_experts", value("num_experts"));
+    }
+    number("num_sms", value("aiv"));
+    if (!short_format) {
+        number("num_tokens", value("num_tokens"));
+        number("topk", value("topk"));
+    }
+    number("pid", value("pid"));
+    const auto stream = record.labels.find("stream");
+    const auto handle = stream == record.labels.end() ? std::nullopt : ParseUnsigned(stream->second);
+    field("stream", handle ? std::to_string(*handle) : "null");
+    field("comm_id", comm_id);
+    time("launch_time", value("launch_ns"));
+    time("start_time", completed ? value("start_ns") : std::nullopt);
+    time("end_time", completed ? value("end_ns") : std::nullopt);
+    number("elapsed_ns", completed ? value("elapsed_ns") : std::nullopt);
+    number("start_tick", completed ? value("start_tick") : std::nullopt);
+    number("end_tick", completed ? value("end_tick") : std::nullopt);
+    jsonl += "}\n";
 }
 }
 std::string EncodeTraceRecords(const std::vector<TraceRecord>& records)
@@ -108,13 +228,14 @@ TraceMetadataSnapshot CurrentTraceMetadata()
 {
     return active_metadata;
 }
-TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle)
+TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle, int64_t dispatch_count)
 {
     auto value = std::make_shared<TraceMetadata>();
     value->parent = std::move(parent);
     value->has_call_ids = true;
     value->api_call_id = api;
     value->handle_id = handle;
+    value->dispatch_count = dispatch_count;
     return value;
 }
 TraceMetadataSnapshot ExchangeTraceMetadata(TraceMetadataSnapshot metadata)
@@ -131,13 +252,17 @@ ScopedTraceMetadata::~ScopedTraceMetadata()
     ExchangeTraceMetadata(std::move(previous_));
 }
 
+void ConfigureTraceTestMode(bool metadata_only)
+{
+    trace_mode.store(metadata_only ? TraceMode::TestMetadataOnly : TraceMode::Test, std::memory_order_relaxed);
+}
+
 std::shared_ptr<KernelTrace> KernelTrace::Open()
 {
-    const char* directory = std::getenv("DEEPEP_TRACE_DIR");
-    if (!directory || !*directory) return {};
-    // Diagnostic metadata-only mode must not allocate a ring or launch calibration/device probes.
-    const char* diagnostic = std::getenv("DEEPEP_TRACE_DIAGNOSTIC_MODE");
-    if (diagnostic && std::strcmp(diagnostic, "metadata") == 0) return {};
+    const char* enable = std::getenv("DEEPEP_TRACE_RECORDER_ENABLE");
+    if (!enable || std::strcmp(enable, "1") != 0) return {};
+    const auto mode = trace_mode.load(std::memory_order_relaxed);
+    if (mode == TraceMode::TestMetadataOnly) return {};
     try {
         static std::mutex mutex;
         static std::map<aclrtContext, std::weak_ptr<KernelTrace>> sinks;
@@ -149,6 +274,7 @@ std::shared_ptr<KernelTrace> KernelTrace::Open()
         if (auto alive = sinks[context].lock()) return alive;
         auto sink = std::shared_ptr<KernelTrace>(new KernelTrace);
         sink->context_ = context;
+        sink->recorder_mode_ = mode == TraceMode::Recorder;
         sink->Init(device);
         sinks[context] = sink;
         return sink;
@@ -161,7 +287,12 @@ std::shared_ptr<KernelTrace> KernelTrace::Open()
 void KernelTrace::Init(int device)
 {
     device_ = device;
-    if (const char* value = std::getenv("DEEPEP_TRACE_SLOTS")) {
+    if (recorder_mode_) {
+        poll_interval_ms_ = ReadRecorderMilliseconds("DEEPEP_TRACE_POLL_INTERVAL_MS", poll_interval_ms_);
+        timeout_ms_ = ReadRecorderMilliseconds("DEEPEP_TRACE_TIMEOUT_MS", timeout_ms_);
+    }
+    const char* value = recorder_mode_ ? nullptr : std::getenv("DEEPEP_TRACE_SLOTS");
+    if (value) {
         char* end{};
         const auto count = std::strtoul(value, &end, 10);
         if (!*value || *value < '0' || *value > '9' || *end || count < 128 || count > 16384)
@@ -298,6 +429,20 @@ KernelTrace::Ticket KernelTrace::Reserve(int rank, uint32_t instance, uint32_t c
                                        const char* kernel_name, uint64_t stream, uint32_t ep_size,
                                        int64_t input_rows, int64_t output_rows)
 {
+    const auto& metadata = active_metadata;
+    int op = -1;
+    int64_t op_count = -1;
+    if (recorder_mode_) {
+        const auto* scope = metadata.get();
+        while (scope && !scope->op_counters) scope = scope->parent.get();
+        if (!scope) return {};
+        const auto comm_id = scope->labels.find("comm_id");
+        if (comm_id == scope->labels.end() || comm_id->second.empty()) return {};
+        const auto kernel = std::find(kRecorderKernelNames.begin(), kRecorderKernelNames.end(), std::string_view(kernel_name));
+        if (kernel == kRecorderKernelNames.end()) return {};
+        op = static_cast<int>(kernel - kRecorderKernelNames.begin());
+        op_count = scope->op_counters->next[op].fetch_add(1, std::memory_order_relaxed);
+    }
     const auto index = cursor_.fetch_add(1, std::memory_order_relaxed) % slot_count_;
     auto& slot = slots_[index];
     auto expected = State::Free;
@@ -318,12 +463,15 @@ KernelTrace::Ticket KernelTrace::Reserve(int rank, uint32_t instance, uint32_t c
     slot.rank = rank;
     slot.instance = instance;
     slot.cores = cores;
-    slot.metadata = CurrentTraceMetadata();
+    slot.op = op;
+    slot.op_count = op_count;
+    slot.metadata = metadata;
     slot.stream = stream;
     slot.ep_size = ep_size;
     slot.input_rows = input_rows;
     slot.output_rows = output_rows;
     slot.logged_launch = false;
+    slot.logged_timeout = false;
     return {reinterpret_cast<uint64_t>(mapped_) + index * kSlotBytes, index, slot.sequence};
 }
 
@@ -332,6 +480,7 @@ void KernelTrace::Submit(Ticket ticket, int64_t launch_ns, int status)
     auto& slot = slots_[ticket.index];
     slot.launch_ns = launch_ns;
     slot.status = status;
+    if (recorder_mode_ && status == ACL_SUCCESS) slot.submit_steady_ns = NowNs<std::chrono::steady_clock>();
     slot.state.store(State::Submitted, std::memory_order_release);
 }
 
@@ -353,39 +502,51 @@ void KernelTrace::Synchronize()
     Check(restored, "restore trace context");
 }
 
-std::vector<TraceRecord> KernelTrace::Drain(bool closing)
+TraceRecord KernelTrace::DescribeSlot(const Slot& slot) const
+{
+    TraceRecord record{"", slot.op_name, slot.kernel_name,
+        {{"gid", static_cast<int64_t>(slot.sequence)}, {"rank", slot.rank},
+         {"local_instance", slot.instance}, {"launch_ns", slot.launch_ns}, {"aiv", slot.cores},
+         {"pid", getpid()}, {"device", device_}}};
+    if (slot.op >= 0) record.values["op"] = slot.op;
+    if (slot.op_count >= 0) record.values["op_count"] = slot.op_count;
+    if (slot.ep_size) record.values["ep_size"] = slot.ep_size;
+    if (slot.input_rows >= 0) record.values["kernel_input_rows"] = slot.input_rows;
+    if (slot.output_rows >= 0) record.values["kernel_output_rows"] = slot.output_rows;
+    for (auto metadata = slot.metadata; metadata; metadata = metadata->parent) {
+        if (metadata->has_call_ids) {
+            record.values.emplace("api_call_id", metadata->api_call_id);
+            record.values.emplace("handle_id", metadata->handle_id);
+            if (metadata->dispatch_count >= 0) record.values.emplace("dispatch_count", metadata->dispatch_count);
+        }
+        record.values.insert(metadata->values.begin(), metadata->values.end());
+        record.labels.insert(metadata->labels.begin(), metadata->labels.end());
+    }
+    record.labels["stream"] = std::to_string(slot.stream);
+    return record;
+}
+
+std::vector<TraceRecord> KernelTrace::Drain(bool closing, bool recorder)
 {
     std::lock_guard<std::mutex> lock(drain_mutex_);
     std::vector<TraceRecord> records;
+    const auto poll_ns = recorder ? NowNs<std::chrono::steady_clock>() : 0;
+    const auto timeout_ns = static_cast<int64_t>(timeout_ms_) * kNsPerMs;
     for (unsigned index = 0; index < slot_count_; ++index) {
         auto& slot = slots_[index];
         if (slot.state.load(std::memory_order_acquire) != State::Submitted) continue;
-        TraceRecord record{"", slot.op_name, slot.kernel_name,
-            {{"gid", static_cast<int64_t>(slot.sequence)}, {"rank", slot.rank},
-             {"local_instance", slot.instance}, {"launch_ns", slot.launch_ns}, {"aiv", slot.cores},
-             {"pid", getpid()}, {"device", device_}}};
-        if (slot.ep_size) record.values["ep_size"] = slot.ep_size;
-        if (slot.input_rows >= 0) record.values["kernel_input_rows"] = slot.input_rows;
-        if (slot.output_rows >= 0) record.values["kernel_output_rows"] = slot.output_rows;
-        for (auto metadata = slot.metadata; metadata; metadata = metadata->parent) {
-            if (metadata->has_call_ids) {
-                record.values.emplace("api_call_id", metadata->api_call_id);
-                record.values.emplace("handle_id", metadata->handle_id);
-            }
-            record.values.insert(metadata->values.begin(), metadata->values.end());
-            record.labels.insert(metadata->labels.begin(), metadata->labels.end());
-        }
-        record.labels["stream"] = std::to_string(slot.stream);
-        if (!slot.logged_launch) {
+        TraceRecord record;
+        if (!recorder) record = DescribeSlot(slot);
+        if (!recorder && !slot.logged_launch) {
             record.event = slot.status ? "launch_error" : "launch";
             record.values["status"] = slot.status;
             records.push_back(record);
             slot.logged_launch = true;
-            if (slot.status) {
-                slot.state.store(State::Quarantined, std::memory_order_release);
-                ++incomplete_;
-                continue;
-            }
+        }
+        if (slot.status != ACL_SUCCESS) {
+            slot.state.store(State::Quarantined, std::memory_order_release);
+            ++incomplete_;
+            continue;
         }
         auto* base = static_cast<uint8_t*>(host_) + index * kSlotBytes;
         uint64_t first = std::numeric_limits<uint64_t>::max(), last = 0;
@@ -404,14 +565,24 @@ std::vector<TraceRecord> KernelTrace::Drain(bool closing)
             last = std::max(last, end);
         }
         if (!ready) {
+            if (recorder && recorder_mode_ && !slot.logged_timeout &&
+                poll_ns - slot.submit_steady_ns >= timeout_ns) {
+                record = DescribeSlot(slot);
+                record.event = "timeout";
+                records.push_back(std::move(record));
+                slot.logged_timeout = true;
+            }
             if (closing) {
-                record.event = "incomplete";
-                records.push_back(record);
+                if (!recorder) {
+                    record.event = "incomplete";
+                    records.push_back(std::move(record));
+                }
                 slot.state.store(State::Quarantined, std::memory_order_release);
                 ++incomplete_;
             }
             continue;
         }
+        if (recorder) record = DescribeSlot(slot);
         record.event = "end";
         record.values.insert({{"start_tick", first}, {"end_tick", last},
             {"start_ns", offset_ns_ + static_cast<int64_t>(first)},
@@ -421,9 +592,29 @@ std::vector<TraceRecord> KernelTrace::Drain(bool closing)
         // All producers published this generation. Keep old bytes; sequence identifies reuse.
         slot.state.store(State::Free, std::memory_order_release);
     }
-    if (closing) records.push_back({"summary", "", "", {{"completed", completed_},
-        {"incomplete", incomplete_}, {"dropped", dropped_.load()}}});
+    if (closing) {
+        const auto dropped = dropped_.load();
+        if (!recorder) {
+            records.push_back({"summary", "", "", {{"completed", completed_},
+                {"incomplete", incomplete_}, {"dropped", dropped}}});
+        } else if (incomplete_ || dropped) {
+            std::fprintf(stderr, "DeepEP trace recorder device %d: incomplete=%llu dropped=%llu\n", device_,
+                static_cast<unsigned long long>(incomplete_), static_cast<unsigned long long>(dropped));
+        }
+    }
     return records;
+}
+
+std::map<std::string, std::string> KernelTrace::DrainProductionBatches(uint32_t bus_id, bool closing)
+{
+    std::map<std::string, std::string> batches;
+    for (const auto& record : Drain(closing, true)) {
+        if (record.event != "end" && record.event != "timeout") continue;
+        const auto comm_id = record.labels.find("comm_id");
+        if (comm_id == record.labels.end() || !IsCanonicalCommId(comm_id->second)) continue;
+        AppendProductionRecord(batches[comm_id->second], record, comm_id->second, bus_id);
+    }
+    return batches;
 }
 
 KernelTrace::~KernelTrace()

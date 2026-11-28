@@ -240,7 +240,9 @@ def byte_ledger(counts, rank, *, tokens, hidden, topk, dtype, idx_bytes, op):
     )
 
 
-def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barrier=False, allow_elastic_barrier=False):
+def select_profile_samples(
+    rows, trace, iterations, device, *, allow_shmem_barrier=False, allow_elastic_barrier=False, allow_v1_barrier=False
+):
     """Select fixed IDs 0..N-1 using caller-stream device events, not row count.
 
     Guards may be clipped by capture boundaries. A missing marker/kernel in a
@@ -328,17 +330,15 @@ def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barri
         if not overlap:
             if begin < intervals[0][0] or begin >= intervals[-1][1]:
                 continue  # explicitly outside the fixed measured interval
-            # Only benchmark alignment in a gap is excluded. ElasticBuffer's
-            # one-AIV barrier shares the internal combine-notify kernel name:
-            # an in-sample notify must remain measured, never filtered by name.
+            # Only benchmark alignment in a gap is excluded. The same kernel
+            # names can appear in actual API work within a measured sample.
+            name = row["Name"]
+            one_block = str(row.get("Block Num", "")).strip() == "1"
             if (
                 (
-                    (allow_shmem_barrier and row["Name"] == "_Z24barrier_on_stream_kernelim")
-                    or (
-                        allow_elastic_barrier
-                        and row["Name"] == "cached_notify_combine_kernel"
-                        and str(row["Block Num"]).strip() == "1"
-                    )
+                    (allow_shmem_barrier and name == "_Z24barrier_on_stream_kernelim")
+                    or (allow_elastic_barrier and name == "cached_notify_combine_kernel" and one_block)
+                    or (allow_v1_barrier and name == "deepep_instance_sync_kernel" and one_block)
                 )
                 and str(row["Device_id"]).strip() == str(device)
                 and str(row["Step Id"]).strip() == "1"
@@ -534,6 +534,7 @@ def parse_profile(
             device,
             allow_shmem_barrier=op.startswith("combine") or all_rank_sync_each_iteration,
             allow_elastic_barrier=all_rank_sync_each_iteration,
+            allow_v1_barrier=api == "v1" and op.startswith("combine"),
         )
     if flush_l2_cache and not all_rank_sync_each_iteration:
         rows, flush_intervals, flush_kernels = split_cache_flush(

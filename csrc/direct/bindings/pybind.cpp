@@ -9,12 +9,45 @@
 
 #include <torch/extension.h>
 #include <chrono>
+#include <dlfcn.h>
+#include <stdexcept>
+#include <string>
+#include <utility>
 
 #include "common/types.h"
 #include "runtime/kernel_trace.h"
 #include "runtime/shmem_instance.h"
 
 namespace {
+uint32_t TracePhysicalDeviceId(int device)
+{
+    using Query = aclError (*)(int32_t, int32_t*);
+    auto query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtGetPhyDevIdByUserDevId"));
+    if (!query) query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtGetPhyDevIdByLogicDevId"));
+    int32_t physical_device_id = -1;
+    if (!query || query(device, &physical_device_id) != ACL_SUCCESS || physical_device_id < 0)
+        throw std::runtime_error("physical device ID unavailable for ACL device " + std::to_string(device));
+    return static_cast<uint32_t>(physical_device_id);
+}
+
+std::string TraceDeviceUuid(int device)
+{
+    using Query = aclError (*)(int32_t, aclrtUuid*);
+    const auto query = reinterpret_cast<Query>(dlsym(RTLD_DEFAULT, "aclrtDeviceGetUuid"));
+    aclrtUuid uuid{};
+    if (!query || query(device, &uuid) != ACL_SUCCESS)
+        throw std::runtime_error("device UUID unavailable for ACL device " + std::to_string(device));
+    constexpr char digits[] = "0123456789abcdef";
+    std::string hex;
+    for (const unsigned char byte : uuid.bytes) {
+        hex += digits[byte >> 4];
+        hex += digits[byte & 0xf];
+    }
+    if (hex.find_first_not_of('0') == std::string::npos)
+        throw std::runtime_error("empty device UUID for ACL device " + std::to_string(device));
+    return hex;
+}
+
 int ProbePythonGil()
 {
 #ifdef Py_GIL_DISABLED
@@ -30,6 +63,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("kernel_trace_diagnostic_version") = 4;
     m.attr("host_dispatch_probe_version") = 3;
     m.attr("kernel_trace_metadata_version") = 2;
+    m.def("_configure_trace_test_mode", &ascend_deepep::trace::ConfigureTraceTestMode,
+          pybind11::arg("metadata_only") = false);
     m.def("check_host_dispatch_gil_probe", []() {
         const int held = ProbePythonGil();
         int released;
@@ -91,20 +126,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     using ascend_deepep::trace::TraceRecord;
     struct Snapshot { ascend_deepep::trace::TraceMetadataSnapshot value; };
     pybind11::class_<Snapshot>(m, "TraceMetadataSnapshot");
-    m.def("make_trace_metadata", [](pybind11::dict fields, const Snapshot& parent) {
+    m.def("make_trace_metadata", [](pybind11::dict fields, const Snapshot& parent, bool recorder) {
         auto value = std::make_shared<ascend_deepep::trace::TraceMetadata>();
         value->parent = parent.value;
+        if (recorder && !parent.value)
+            value->op_counters = std::make_shared<ascend_deepep::trace::KernelOpCounters>();
         for (const auto& item : fields) {
             auto key = pybind11::cast<std::string>(item.first);
             if (pybind11::isinstance<pybind11::str>(item.second)) value->labels[key] = pybind11::cast<std::string>(item.second);
             else value->values[key] = pybind11::cast<int64_t>(item.second);
         }
         return Snapshot{value};
-    }, pybind11::arg("fields"), pybind11::arg("parent") = Snapshot{});
-    m.def("push_trace_metadata", [](const Snapshot& base, int64_t api, int64_t handle) {
-        auto value = ascend_deepep::trace::MakeCallMetadata(base.value, api, handle);
+    }, pybind11::arg("fields"), pybind11::arg("parent") = Snapshot{}, pybind11::arg("recorder") = false);
+    m.def("push_trace_metadata", [](const Snapshot& base, int64_t api, int64_t handle, int64_t dispatch_count) {
+        auto value = ascend_deepep::trace::MakeCallMetadata(base.value, api, handle, dispatch_count);
         return Snapshot{ascend_deepep::trace::ExchangeTraceMetadata(value)};
-    });
+    }, pybind11::arg("base"), pybind11::arg("api"), pybind11::arg("handle"), pybind11::arg("dispatch_count") = -1);
     m.def("restore_trace_metadata", [](const Snapshot& previous) {
         ascend_deepep::trace::ExchangeTraceMetadata(previous.value);
     });
@@ -121,7 +158,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def_property_readonly("identity", [](const KernelTrace& trace) {
             return reinterpret_cast<uintptr_t>(&trace);
         })
+        .def_property_readonly("poll_interval_ms", &KernelTrace::PollIntervalMs)
         .def("calibration", [to_dict](const KernelTrace& trace) { return to_dict(trace.Calibration()); })
+        .def(
+            "device_identity",
+            [](const KernelTrace& trace) {
+                const int device = trace.Device();
+                return std::pair{TracePhysicalDeviceId(device), TraceDeviceUuid(device)};
+            },
+            pybind11::call_guard<pybind11::gil_scoped_release>())
+        .def(
+            "drain_production_batches",
+            [](KernelTrace& trace, uint32_t bus_id, bool closing) {
+                std::map<std::string, std::string> batches;
+                {
+                    pybind11::gil_scoped_release release;
+                    batches = trace.DrainProductionBatches(bus_id, closing);
+                }
+                pybind11::list result;
+                for (const auto& [comm_id, jsonl] : batches)
+                    result.append(pybind11::make_tuple(pybind11::str(comm_id), pybind11::bytes(jsonl)));
+                return result;
+            },
+            pybind11::arg("bus_id"), pybind11::arg("closing") = false)
         .def("drain_trace_json", [](KernelTrace& trace, bool closing) {
             std::string text;
             {

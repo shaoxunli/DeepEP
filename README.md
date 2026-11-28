@@ -112,6 +112,26 @@ python -m pip install -v --no-build-isolation --no-deps .
 
 发行包名为 `ascend-deepep`，Python 导入名为 `deep_ep`。Wheel 打包和多机安装见[构建指南](docs/build.md)。
 
+### Kernel Trace
+
+Ascend950 Global Clos 的 V1 `Buffer` 和 V2 `ElasticBuffer` 在 eager UDMA 路径支持按 kernel 记录 notify、dispatch 和 combine。默认关闭，运行前在同一 EP 组的所有 rank 设置：
+
+```bash
+export DEEPEP_TRACE_RECORDER_ENABLE=1
+# 可选：在创建 Buffer 前指定写入目录和时间参数
+# export DEEPEP_TRACE_DIR=/path/to/deepep-logs
+# export DEEPEP_TRACE_POLL_INTERVAL_MS=2
+# export DEEPEP_TRACE_TIMEOUT_MS=10000
+```
+
+`DEEPEP_TRACE_POLL_INTERVAL_MS` 是后台每次扫描前的等待时间，默认 2 ms。`DEEPEP_TRACE_TIMEOUT_MS` 是 Host 成功提交后可报告 `type=1` 的超时阈值，默认 10000 ms（10 秒）。超时在后台扫描时判定。
+
+日志是每行一条 JSON，写入 `DEEPEP_TRACE_DIR` 指定的本机目录。未设置或为空时，使用 `/dockerdata/.trmt/deepep/`。文件名为 `trmt-deepep-trace-<commId>-<busId>-<0–7>.txt`。
+
+`commId` 是随机无符号 64 位通信组 ID 的十进制表示。文件名的 `busId` 和 JSON 的 `bus_id` 均直接使用当前主机的 CANN 物理设备号，各连接类型规则相同。例如物理设备 4 对应 `bus_id=4`。JSON 中的 `comm_id` 和 `bus_id` 都是整数。每个通信组和设备组合固定 8 个文件，单文件上限为 1,000,000,000 字节，写满后循环覆盖最旧文件。
+
+**采集器启动时会清理该目录中设备归属匹配的历史 trace 文件。重跑前请提前归档需要保留的日志。** [字段、轮转规则与开发诊断](docs/kernel-trace.md)。
+
 ### 安装 MegaMoE
 
 在匹配 Torch/torch_npu 的环境中加载 CANN 9.2.0 后运行：

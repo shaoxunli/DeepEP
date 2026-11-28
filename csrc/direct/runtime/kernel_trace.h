@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -11,15 +12,27 @@
 #include "common/kernel_trace_layout.h"
 
 namespace ascend_deepep::trace {
+struct KernelOpCounters {
+    static constexpr std::size_t kCount = 10;
+    KernelOpCounters()
+    {
+        for (auto& count : next) count.store(0, std::memory_order_relaxed);
+    }
+    std::array<std::atomic<int64_t>, kCount> next;
+};
+
 struct TraceMetadata {
     std::shared_ptr<const TraceMetadata> parent;
     std::map<std::string, int64_t> values;
     std::map<std::string, std::string> labels;
     bool has_call_ids = false;
     int64_t api_call_id = 0, handle_id = 0;
+    int64_t dispatch_count = -1;
+    std::shared_ptr<KernelOpCounters> op_counters;
 };
 using TraceMetadataSnapshot = std::shared_ptr<const TraceMetadata>;
-TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle);
+TraceMetadataSnapshot MakeCallMetadata(TraceMetadataSnapshot parent, int64_t api, int64_t handle,
+                                      int64_t dispatch_count = -1);
 TraceMetadataSnapshot CurrentTraceMetadata();
 TraceMetadataSnapshot ExchangeTraceMetadata(TraceMetadataSnapshot metadata);
 class ScopedTraceMetadata {
@@ -37,6 +50,7 @@ struct TraceRecord {
     std::map<std::string, std::string> labels;
 };
 std::string EncodeTraceRecords(const std::vector<TraceRecord>& records);
+void ConfigureTraceTestMode(bool metadata_only);
 // Opt-in Host diagnostics. Fixed-size samples are reserved before the workload and read afterwards.
 enum class DispatchProbePoint : unsigned {
     NativeEntry, NotifyBegin, NotifyEnd, WaitBegin, FirstPending, FirstCountReady, AllCountsReady,
@@ -92,7 +106,11 @@ public:
                    const char* op_name, const char* kernel_name, uint64_t stream = 0, uint32_t ep_size = 0,
                    int64_t input_rows = -1, int64_t output_rows = -1);
     void Submit(Ticket ticket, int64_t launch_ns, int status);
-    std::vector<TraceRecord> Drain(bool closing = false);
+    std::vector<TraceRecord> Drain(bool closing = false, bool recorder = false);
+    // Each communication group receives its ordered batch of production JSONL records.
+    std::map<std::string, std::string> DrainProductionBatches(uint32_t bus_id, bool closing = false);
+    int Device() const { return device_; }
+    int PollIntervalMs() const { return poll_interval_ms_; }
     TraceRecord Calibration() const;
     void Synchronize();
 private:
@@ -101,7 +119,10 @@ private:
         std::atomic<State> state{State::Free};
         uint64_t sequence{};
         int64_t launch_ns{};
+        int64_t submit_steady_ns{};
         int rank{}, status{};
+        int op = -1;
+        int64_t op_count = -1;
         uint32_t instance{}, cores{};
         std::string op_name, kernel_name;
         TraceMetadataSnapshot metadata;
@@ -109,9 +130,14 @@ private:
         uint32_t ep_size{};
         int64_t input_rows{-1}, output_rows{-1};
         bool logged_launch{};
+        bool logged_timeout{};
     };
+    TraceRecord DescribeSlot(const Slot& slot) const;
     KernelTrace() = default;
     void Init(int device);
+    bool recorder_mode_ = true;
+    int poll_interval_ms_ = 2;
+    int timeout_ms_ = 10000;
     unsigned slot_count_ = 128;
     std::unique_ptr<Slot[]> slots_;
     std::mutex drain_mutex_;

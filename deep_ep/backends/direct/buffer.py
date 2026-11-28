@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from threading import RLock
 from typing import Any, List, Optional, Tuple, Union
 
@@ -23,6 +23,7 @@ _COMMUNICATION_STREAMS: dict[tuple[int, int], Any] = {}
 _COMMUNICATION_STREAM_LOCK = RLock()
 _MAX_SHMEM_INTRANODE_RANKS = 1024
 _SUPPORTED_TRANSPORTS = frozenset(("auto", "mte", "roce", "sdma", "udma"))
+_NO_TRACE = nullcontext()
 
 
 class _V1Handle(tuple):
@@ -198,6 +199,8 @@ class Buffer:
         self._lock = RLock()
         self._destroyed = False
         self._failed_event_tensors: Optional[Tuple[Any, ...]] = None
+        self._kernel_trace = None
+        self._trace_session = None
         native_type = get_native_class("BufferRuntime")
         with _BOOTSTRAP_LOCK:
             unique_id, bootstrap_key = _prepare_shmem_bootstrap(
@@ -238,10 +241,16 @@ class Buffer:
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
                 mapping_check(comm if comm is not None else resolved_group)
+            self._communication_stream = get_global_comm_stream()
+            if resolved_transport == "udma":
+                from ...utils.kernel_trace import attach_trace_session
+
+                self._kernel_trace, self._trace_session = attach_trace_session(
+                    load_native_module(), resolved_group, rank, resolved_num_ranks, _bootstrap_all_gather, comm=comm
+                )
         # Slot/generation tracks one future layout -> dispatch -> combine
         # session. The native runtime owns the symmetric workspace itself.
         self._slot = Slot(0, owner=self, native_resources=self._native)
-        self._communication_stream = get_global_comm_stream()
 
     @property
     def udma_auto_policy(self):
@@ -364,10 +373,24 @@ class Buffer:
             # Device work enqueued on the communication stream must finish
             # before its SHMEM queues and symmetric allocations are released.
             self._communication_stream.synchronize()
-            self._native.destroy()
-            self._destroyed = True
-            self._failed_event_tensors = None
-            self._communication_stream = None
+            try:
+                self._detach_trace(synchronized=True)
+            finally:
+                self._native.destroy()
+                self._destroyed = True
+                self._failed_event_tensors = None
+                self._communication_stream = None
+
+    def _detach_trace(self, *, synchronized=False) -> None:
+        identity = getattr(self, "_kernel_trace", None)
+        session = getattr(self, "_trace_session", None)
+        if identity is None and session is None:
+            return
+        from ...utils.kernel_trace import detach_trace_session
+
+        self._kernel_trace = None
+        self._trace_session = None
+        detach_trace_session(identity, session, synchronized=synchronized)
 
     @staticmethod
     def is_sm90_compiled() -> bool:
@@ -507,7 +530,8 @@ class Buffer:
         x_tensor, x_scales = _split_x_and_scales(x)
         if self.num_max_tokens_per_rank is not None and x_tensor.size(0) > self.num_max_tokens_per_rank:
             raise ValueError("local token count exceeds num_max_tokens_per_rank")
-        if _is_capturing() and handle is None and num_worst_tokens <= 0:
+        capturing = _is_capturing()
+        if capturing and handle is None and num_worst_tokens <= 0:
             raise RuntimeError("NPU graph dispatch requires num_worst_tokens > 0 (no CPU count readback)")
         if handle is None and num_worst_tokens > 0:
             capacity = self.num_max_tokens_per_rank if self.num_max_tokens_per_rank is not None else x_tensor.size(0)
@@ -533,6 +557,8 @@ class Buffer:
             else None
         )
         del num_tokens_per_rdma_rank
+        trace_session = getattr(self, "_trace_session", None)
+        trace_call = _NO_TRACE
 
         if handle is not None:
             if isinstance(handle, _V1Handle) and handle._buffer_owner is not self:
@@ -548,7 +574,20 @@ class Buffer:
                 _send_head,
             ) = _unpack_v1_handle(handle)
             num_recv_tokens = int(recv_src_idx.size(0))
-            with _use_comm_stream_after_dependency(self._communication_stream, previous_event):
+            if trace_session is not None and not capturing:
+                trace_handle = handle if isinstance(handle, _V1Handle) else None
+                num_tokens = x_tensor.size(0)
+                trace_call = trace_session.call_shape(
+                    "dispatch",
+                    x_tensor,
+                    num_tokens=num_tokens,
+                    num_experts=getattr(trace_handle, "_trace_num_experts", None),
+                    topk=getattr(trace_handle, "_trace_topk", None),
+                    handle=trace_handle,
+                    cached=True,
+                    capacity=self.num_max_tokens_per_rank or num_tokens,
+                )
+            with _use_comm_stream_after_dependency(self._communication_stream, previous_event), trace_call:
                 (
                     recv_x,
                     recv_x_scales,
@@ -606,7 +645,19 @@ class Buffer:
             raise ValueError("is_token_in_rank is required for non-cached dispatch")
         if num_tokens_per_expert is None:
             raise ValueError("num_tokens_per_expert is required for non-cached dispatch")
-        with _use_comm_stream_after_dependency(self._communication_stream, previous_event):
+        if trace_session is not None and not capturing:
+            num_tokens = x_tensor.size(0)
+            trace_num_experts = num_tokens_per_expert.numel()
+            trace_topk = topk_idx.size(1) if getattr(topk_idx, "ndim", None) == 2 else None
+            trace_call = trace_session.call_shape(
+                "dispatch",
+                x_tensor,
+                num_tokens=num_tokens,
+                num_experts=trace_num_experts,
+                topk=trace_topk,
+                capacity=self.num_max_tokens_per_rank or num_tokens,
+            )
+        with _use_comm_stream_after_dependency(self._communication_stream, previous_event), trace_call as trace_metadata:
             (
                 recv_x,
                 recv_x_scales,
@@ -657,6 +708,12 @@ class Buffer:
             self,
             dispatch_plan,
         )
+        if trace_metadata is not None:
+            v1_handle._trace_num_experts = trace_num_experts
+            v1_handle._trace_topk = trace_topk
+            v1_handle._trace_handle_id = trace_metadata["handle_id"]
+            if "dispatch_count" in trace_metadata:
+                v1_handle._trace_dispatch_count = trace_metadata["dispatch_count"]
         plan_refs = () if dispatch_plan is None else (dispatch_plan,)
         _record_recv_outputs_on_current_stream(*v1_handle, *plan_refs)
         event = self._finish_comm_event(
@@ -727,7 +784,24 @@ class Buffer:
         ) = _unpack_v1_handle(handle)
         bias_0, bias_1 = self._unpack_bias(bias)
 
-        with _use_comm_stream_after_dependency(self._communication_stream, previous_event):
+        trace_session = getattr(self, "_trace_session", None)
+        trace_call = _NO_TRACE
+        if trace_session is not None and not _is_capturing():
+            trace_handle = handle if isinstance(handle, _V1Handle) else None
+            num_tokens = send_head.size(0)
+            trace_topk = getattr(trace_handle, "_trace_topk", None)
+            if trace_topk is None and getattr(topk_weights, "ndim", None) == 2:
+                trace_topk = topk_weights.size(1)
+            trace_call = trace_session.call_shape(
+                "combine",
+                x,
+                num_tokens=num_tokens,
+                num_experts=getattr(trace_handle, "_trace_num_experts", None),
+                topk=trace_topk,
+                handle=trace_handle,
+                capacity=self.num_max_tokens_per_rank or num_tokens,
+            )
+        with _use_comm_stream_after_dependency(self._communication_stream, previous_event), trace_call:
             recv_x, recv_topk_weights = self._native.intranode_combine(
                 x,
                 topk_weights,
@@ -995,6 +1069,8 @@ class Buffer:
                     ResourceWarning,
                     stacklevel=2,
                 )
+                return
+            self._detach_trace()
         except Exception:
             # Python may already be partially finalized.
             pass

@@ -533,17 +533,25 @@ class ElasticBuffer:
             if self._destroyed:
                 return
             self.barrier(use_comm_stream=True, with_cpu_sync=True)
-            trace = getattr(self, "_kernel_trace", None)
-            if trace is not None:
-                from ...utils.kernel_trace import KernelTrace
+            try:
+                self._detach_trace(synchronized=True)
+            finally:
+                self._native.destroy()
+                self._destroyed = True
+                self.runtime = None
+                self._native = None
+                self._communication_stream = None
 
-                KernelTrace.detach(trace)
-                self._kernel_trace = None
-            self._native.destroy()
-            self._destroyed = True
-            self.runtime = None
-            self._native = None
-            self._communication_stream = None
+    def _detach_trace(self, *, synchronized=False) -> None:
+        trace = getattr(self, "_kernel_trace", None)
+        if trace is None:
+            return
+        from ...utils.kernel_trace import detach_trace_session
+
+        session = getattr(self, "_trace_session", None)
+        self._kernel_trace = None
+        self._trace_session = None
+        detach_trace_session(trace, session, synchronized=synchronized)
 
     def barrier(
         self,
@@ -1015,6 +1023,8 @@ class ElasticBuffer:
             )
             _record_recv_outputs_on_current_stream(*public_handle)
             handle._trace_handle_id = trace_metadata["handle_id"] if trace_metadata is not None else None
+            if trace_metadata is not None and "dispatch_count" in trace_metadata:
+                handle._trace_dispatch_count = trace_metadata["dispatch_count"]
             handle._buffer_token = self._handle_token
             handle._buffer_owner = self
             handle._udma_policy = policy
@@ -1276,12 +1286,7 @@ class ElasticBuffer:
                     # Finalizers cannot propagate. Fall back to native local
                     # teardown if collective teardown is no longer possible.
                     pass
-            trace = getattr(self, "_kernel_trace", None)
-            if trace is not None:
-                from ...utils.kernel_trace import KernelTrace
-
-                KernelTrace.detach(trace)
-                self._kernel_trace = None
+            self._detach_trace()
             self.runtime = None
             self._native = None
             self._communication_stream = None

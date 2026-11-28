@@ -1,45 +1,102 @@
 # KernelTrace：notify、dispatch 与 combine 采集
 
-在 Ascend950 Global Clos 上，给训练进程设置 `DEEPEP_TRACE_DIR` 即可开启。目录应由当前作业独占并允许各 rank 写入。普通调用方式与上游相同。采集 eager V2 调用实际启动的下列 kernel，沿用相同的 Python 后台线程和日志格式。
+Ascend950 Global Clos 的生产采集器默认关闭。在创建 Buffer 前，给同一 EP 组的所有 rank 设置 `DEEPEP_TRACE_RECORDER_ENABLE=1` 可以开启采集。`0` 或未设置时关闭。采集范围是 V1 `Buffer` 和 V2 `ElasticBuffer` 的 eager 调用实际启动的下列 UDMA kernel。
 
-| op_name | kernel_name | 范围 |
-| --- | --- | --- |
-| notify_dispatch | notify_dispatch_kernel | fresh dispatch 的计数、元数据及通知阶段 |
-| cached_notify_dispatch | cached_notify_dispatch_kernel | cached dispatch 原有的通知同步 |
-| dispatch | v1_dispatch_udma_kernel | fresh / cached dispatch 通信及 kernel 内部输出处理 |
-| cached_notify_combine | cached_notify_combine_kernel | 仅在执行路径实际启动独立 notify 时记录 |
-| combine | v1_combine_udma_kernel | 融合通信和归约 |
-| combine | v1_combine_udma_comm_kernel / v1_combine_udma_reduce_kernel | 分离的通信和归约分别记录 |
-| combine | v1_combine_udma_early_kernel / v1_combine_udma_remaining_kernel / v1_combine_udma_pipeline_kernel | 所选策略实际执行的阶段分别记录 |
+| op | kernel_name | 范围 | 生产日志格式 |
+| --- | --- | --- | --- |
+| 0 | notify_dispatch_kernel | fresh dispatch 的计数、元数据及通知阶段 | 短 |
+| 1 | cached_notify_dispatch_kernel | cached dispatch 的通知同步 | 短 |
+| 2 | v1_dispatch_udma_kernel | fresh / cached dispatch 通信及核内输出处理 | 长 |
+| 3 | cached_notify_combine_kernel | 仅在执行路径实际启动独立 notify 时记录 | 短 |
+| 4 | v1_combine_udma_kernel | 融合通信和归约 | 长 |
+| 5 | v1_combine_udma_comm_kernel | 独立通信阶段 | 长 |
+| 6 | v1_combine_udma_reduce_kernel | 独立归约阶段 | 短 |
+| 7 | v1_combine_udma_early_kernel | 提前发送阶段 | 长 |
+| 8 | v1_combine_udma_remaining_kernel | 剩余阶段 | 长 |
+| 9 | v1_combine_udma_pipeline_kernel | 流水阶段 | 长 |
 
 普通 fused/communication combine 的 Begin 同步在通信 kernel 内，其耗时包含在 combine 记录中，不额外生成 notify 记录。采集不改变策略，也不额外启动通知 kernel。layout、expand、aggregate、缓存计划重建、显式 Buffer barrier 和 NPU Graph 捕获/重放不采集。图捕获时不预留槽位，避免重放旧序号。
 
-## 运行与校验
+V1 fresh dispatch 记录 op 0 和 2，cached dispatch 记录 op 1 和 2，普通 combine 记录 op 4。V1 benchmark 在 combine 的 profiler 阶段启用独立 notify，因此这些调用还会记录 op 3。
+
+## 运行、轮转与归档
 
 按[构建指南](build.md)在含匹配 CANN、Torch、torch_npu 和 SHMEM SDK 的环境安装本分支的 wheel。Host 与 Device 两部分均需重新构建。在单机四卡上可使用现有 benchmark 验证。
 
 ```bash
 set -e
 RUN="$(mktemp -d "$PWD/kernel-trace-XXXXXX")"
-export DEEPEP_TRACE_DIR="$RUN/trace"
-python -u benchmarks/clos/bench_v2_bandwidth.py \
+export DEEPEP_TRACE_RECORDER_ENABLE=1
+# 可选：在创建 Buffer 前指定本机输出目录和时间参数
+# export DEEPEP_TRACE_DIR=/path/to/deepep-logs
+# export DEEPEP_TRACE_POLL_INTERVAL_MS=2
+# export DEEPEP_TRACE_TIMEOUT_MS=10000
+python -u benchmarks/clos/bench_v1_bandwidth.py \
     --ep-size 4 --nnodes 1 --aiv 32 --dtypes bf16 --expand 0 \
     --num-tokens 2048 --hidden 6144 --num-topk 8 --experts-per-rank 32 \
     --warmup 2 --iterations 5 --no-flush-l2-cache --output "$RUN/bench"
-python scripts/check_kernel_trace.py "$RUN/trace" --ranks 4 --require-ops notify_dispatch dispatch combine --require-metadata
+ls -lh "${DEEPEP_TRACE_DIR:-/dockerdata/.trmt/deepep}"/trmt-deepep-trace-*.txt
 ```
 
-每个文件名包含主机、PID、设备和文件创建时间。校验器检查各 rank 是否有指定类型的成功完成记录、launch 与 end 是否配对、时钟换算是否一致，以及是否丢样。一次 API 调用可能启动多个 kernel，基准的预热和准备也会产生记录，因此记录数不等于 iterations。增加 eager 调用数后可用 `--require-reuse` 要求每个文件超过 128 条完成记录；新日志按 calibration.slots 的实际容量检查，旧日志回退到 128；仅记录的大容量试验不宣称槽位复用。逐核 done_seq 的代际校验还需原生协议测试。性能验收需使用相同输入、资源和启动方式做开关交替对照，并同时记录丢样数。
+验证 V2 时使用同样的参数运行 `benchmarks/clos/bench_v2_bandwidth.py`。
+
+生产日志写入 `DEEPEP_TRACE_DIR` 指定的本机可写目录，未设置或为空时使用 `/dockerdata/.trmt/deepep/`。请在创建 Buffer 前设置目录，可以使用相对路径或指向目标目录的符号链接。采集开关仍由 `DEEPEP_TRACE_RECORDER_ENABLE` 控制。文件前缀、容量和文件数固定，文件名为 `trmt-deepep-trace-<commId>-<busId>-<序号>.txt`，其中：
+
+- `commId` 是随机无符号 64 位通信组 ID 的十进制表示，文件名中不补前导零。EP rank 0 在 Buffer 初始化时调用 `secrets.randbits(64)` 生成该 ID，并通过 all-gather 同步。日志中的 `comm_id` 为同一 ID 的 JSON 整数。
+- `busId` 是当前主机的 CANN 物理设备编号，和日志中的整数 `bus_id` 一致，各连接类型都直接使用该值。采集器通过 `aclrtGetPhyDevIdByUserDevId` 将 ACL 用户设备编号转换为物理设备编号。运行时缺少该符号时，使用 `aclrtGetPhyDevIdByLogicDevId`。例如 ACL 用户设备 `0` 映射到物理设备 `3` 时，日志记录 `bus_id=3`。同一通信组内，如果两个 rank 的 `busId` 相同，应使用不同的输出目录以区分文件名。无法取得物理设备编号或 CANN 设备 UUID 时，采集器会报告警告并跳过该设备。[CANN 设备标识接口](https://github.com/hicann/runtime/blob/master/docs/zh/api_ref/04_device_management.md#aclrtgetphydevidbyuserdevid)
+- 序号为 `0–7`，同一 `(commId, busId)` 固定有八个文件。单文件上限为 1 GB（1,000,000,000 字节），按 UTF-8 整行统计，包含换行符。下一行将超限时，先切换到 `(i+1) % 8` 并截断目标文件，再写入该行。每组每卡的日志内容合计最多 8 GB；单组八卡最多 64 GB。
+
+**启动时，采集器按 CANN 设备 UUID 和物理设备编号获取设备锁。** 采集器持锁扫描所选目录的 `owner-v2` 归属标记，清理设备 UUID、物理设备编号、`busId` 均匹配的旧通信组普通日志文件及归属标记。该规则也适用于通信组 ID 为 32 个小写十六进制字符的 `owner-v2` 标记。历史 `busId` 与当前物理设备编号不同的文件、旧版归属标记及对应日志、无归属日志均保留。锁文件可用只读方式打开，采集器由持锁进程正常销毁时会显式解锁。需要保留的日志请在同一设备重跑前移出该目录。
+
+## 轮询和超时配置
+
+| 环境变量 | 默认值 | 含义 |
+| --- | ---: | --- |
+| `DEEPEP_TRACE_POLL_INTERVAL_MS` | 2 ms | 生产后台线程在每次扫描前的等待时间。收集、写入和线程调度也会影响相邻扫描的实际间隔。 |
+| `DEEPEP_TRACE_TIMEOUT_MS` | 10000 ms（10 秒） | 从 Host 成功提交开始计时。达到阈值后，后台扫描仍未收齐完成序号时才报告 `type=1`。 |
+
+两个值独立设置，均填写 1～2,147,483,647 的十进制整数，单位为毫秒。未设置或为空时使用默认值。请在启动训练、创建 Buffer 前设置，修改后需重新启动。无效值会发出警告并关闭该设备在本进程中的生产采集，训练继续运行。开发诊断保留原有设置。
+
+## 生产记录字段
+
+文件扩展名为 `.txt`，内容是 UTF-8 JSONL。每行对应一次采样后的完成或超时观测。记录格式由 `op` 决定，同一 kernel 的 `type=1` 和 `type=2` 具有相同的字段集合。
+
+- 长格式（`op=2,4,5,7,8,9`）输出下表全部 23 个字段。
+- 短格式（`op=0,1,3,6`）省略 `ep_size`、`hidden_size`、`num_experts`、`num_tokens`、`topk` 这 5 个键，输出其余 18 个字段。
+
+| 字段 | 含义 |
+| --- | --- |
+| `type` | `2` 表示所有参与 AIV 的完成序号已匹配。`1` 表示 Host 成功提交后达到配置的超时阈值，轮询时仍未收齐完成序号。每个 `gid` 至多报告一次超时；之后完成仍可输出同一 `gid` 的 `type=2`。Host 提交失败与未观察到设备完成分别处理。 |
+| `gid`、`op`、`op_count` | Host 为有效票据分配的进程内序号（从 1 开始）、上表固定 kernel 编号，以及本 rank 在当前通信组中同名 kernel 的启动计数（从 0 开始）。 |
+| `dispatch_count` | Python dispatch 调用计数，从 0 开始。fresh 与 cached 各按一次调用计数，同一次调用的 notify 与 dispatch 保持一致。combine 使用 handle 关联的原始 fresh dispatch 计数；不可取得时为 `null`。 |
+| `bus_id`、`rank`、`nvl_rank` | CANN 物理设备编号、EP 组内 rank、按约定计算的 `rank % 16`。 |
+| `num_sms` | 实际参与的 AIV 数。 |
+| `ep_size`、`hidden_size`、`num_experts`、`num_tokens`、`topk` | 仅长格式。分别为 EP 组大小、API 输入特征维度、专家数、原始路由 tensor 行数及 top-k。缺少相应元数据时字段值可为 `null`。 |
+| `pid`、`stream`、`comm_id` | 进程号、启动时的本地 ACL 流句柄（无符号整数）、随机无符号 64 位通信组 ID（JSON 整数）。 |
+| `launch_time`、`start_time`、`end_time` | 提交前的 Host 时间、校准后的最早设备开始和最晚设备结束时间。采用 UTC+8，格式为 `YYYY-MM-DD HH:MM:SS.ffffff`。 |
+| `elapsed_ns`、`start_tick`、`end_tick` | 设备起止 tick 以及两者的差值，Ascend950 的 1 GHz tick 对应纳秒。 |
+
+超时只有 Host 已成功提交这一事实。此时 `start_time`、`end_time`、`elapsed_ns`、`start_tick` 和 `end_tick` 都是 `null`，槽位继续等待设备写入。超时由达到阈值后的后台扫描观察，业务线程无需等待。生产文件只包含 `type=1/2`，时钟校准仍用于内部换算。
+
+长格式完成记录（`op=2`）：
+
+```json
+{"type":2,"gid":1,"op":2,"op_count":0,"dispatch_count":0,"ep_size":4,"bus_id":3,"rank":0,"nvl_rank":0,"hidden_size":6144,"num_experts":256,"num_sms":32,"num_tokens":2048,"topk":8,"pid":1864,"stream":187651357453200,"comm_id":16619284372657870125,"launch_time":"2026-11-12 15:29:04.967346","start_time":"2026-11-12 15:29:04.967558","end_time":"2026-11-12 15:29:04.967564","elapsed_ns":6000,"start_tick":120000,"end_tick":126000}
+```
+
+短格式超时记录（`op=0`）：
+
+```json
+{"type":1,"gid":2,"op":0,"op_count":0,"dispatch_count":1,"bus_id":3,"rank":0,"nvl_rank":0,"num_sms":32,"pid":1864,"stream":187651357453200,"comm_id":16619284372657870125,"launch_time":"2026-11-12 15:29:05.010000","start_time":null,"end_time":null,"elapsed_ns":null,"start_tick":null,"end_tick":null}
+```
 
 ## 时间含义
 
 | 记录 | 来源及含义 |
 | --- | --- |
-| calibration | 首个启用采集的 UDMA Buffer 在当前 ACL context 创建采集器，短 kernel 读取设备 tick。Host 使用私有流包围这次采样，同步一次，保存主机单调时钟窗口的宽度和墙钟偏移。共享该采集器的 Buffer 共用同一偏移。 |
-| launch | Host 在调用相应 kernel 启动封装前读取 Unix 墙钟，单位 ns。封装返回后把时间与当前线程的 ACL 状态交给日志线程。 |
-| end | 同一个 gid 的完成记录。每个参与 AIV 在本核实现的入口和尾部读取 tick。start_tick 取各核最小值，end_tick 取各核最大值，覆盖本 rank 参与核的执行区间。 |
-| launch_error / incomplete | 提交路径报告异常，或在采集器关闭时仍缺少有效 tick。这些记录保留 gid 以便定位。 |
-| summary | 正常关闭时汇总已完成数、未完成数和队列竞争导致的丢样数。 |
+| 校准 | 首个启用采集的 UDMA Buffer 在当前 ACL context 创建采集器，短 kernel 读取设备 tick。Host 使用私有流包围这次采样，同步一次，保存主机单调时钟窗口的宽度和墙钟偏移。共享该采集器的 Buffer 共用同一偏移。 |
+| Host 提交 | Host 在调用相应 kernel 启动封装前读取 Unix 墙钟，单位 ns。封装返回后把时间与当前线程的 ACL 状态交给日志线程。 |
+| Device 完成 | 每个参与 AIV 在本核实现的入口和尾部读取 tick。`start_tick` 取各核最小值，`end_tick` 取各核最大值，覆盖本 rank 参与核的执行区间。 |
 
 Ascend950 按 1 GHz 换算，令校准核采样为 $C_0$，Host 单调时钟包围采样的中点为 $M_0$，另一次相邻采样所得墙钟和单调时钟为 $W_a,M_a$，所有 Host 时间使用 ns。
 
@@ -51,18 +108,24 @@ $$
 
 ## 上报和资源
 
-Python KernelTrace 在每个进程内共享一个后台线程，管理各活跃 ACL context 的原生采集器。C++ 提供 calibration、drain_trace_json、synchronize 接口。Python 每轮休眠约 2 ms 后调用原生侧回收；原生侧释放 GIL，完成记录合并、JSONL 编码和原生对象清理，返回一块文本。Python 负责批量写入和刷新。
+Python KernelTrace 在每个进程内共享一个后台线程，管理各活跃 ACL context 的原生采集器。每轮等待后，线程调用 `KernelTrace::DrainProductionBatches()`，在释放 GIL 的情况下读取并回收槽位、格式化时间并按通信组编码 JSONL。Python 接收每个通信组的一批字节，批量写入文件。当前文件放不下整批时，按完整行切分，再轮转写入剩余日志。
 
-每个采集器默认分配 128 槽的 Host 映射内存，每槽预留 64 个 AIV，每个 AIV 占用 256 字节，总计约 2 MiB。核内起始 tick 保存在局部变量。结束时 dispatch/notify 复用已释放的 UB，combine/cached notify 在工作结束后使用 32 字节 UB，将 start_tick、end_tick 写入偏移 0，等待 MTE3_S 后，在偏移 128 发布 done_seq。第二次写出也用 MTE3_S 保护 UB 生命周期。combine/cached notify 在读取结束 tick 前用本核 V_S、MTE3_S 将流水完成推进到标量侧；不增加全卡或全核同步。每个 AIV 独占自己的区域。
+生产日志写入失败后最多重试 3 次，每次重新写入前等待 3 ms。短写时从剩余位置继续，写完一行后下一行恢复重试额度。重试耗尽后，采集器保留已写完的行，尝试截掉未写完的半行并停止写入该通信组，其他通信组继续写入。
+
+正式采集器固定分配 128 槽的 Host 映射内存，每槽预留 64 个 AIV，每个 AIV 占用 256 字节，总计约 2 MiB。核内起始 tick 保存在局部变量。结束时 dispatch/notify 复用已释放的 UB，combine/cached notify 在工作结束后使用 32 字节 UB，将 start_tick、end_tick 写入偏移 0，等待 MTE3_S 后，在偏移 128 发布 done_seq。第二次写出也用 MTE3_S 保护 UB 生命周期。combine/cached notify 在读取结束 tick 前用本核 V_S、MTE3_S 将流水完成推进到标量侧；不增加全卡或全核同步。每个 AIV 独占自己的区域。
 
 Host 为成功预留的槽分配从 1 开始的进程内序号，kernel 按此序号发布。只有全部参与核的 done_seq 等于本轮序号才消费数据。回收后保留旧 tick 和序号，下一轮靠新序号识别数据。占用的槽会导致当前采集跳过并记录 dropped。提交异常的槽隔离到销毁。
 
 最后一个共享采集器的 Python Buffer 释放时同步设备，排空记录并关闭日志。正常退出也会停止线程并排空记录。强制退出可能丢失末尾数据。Python 调度与 GIL 会影响日志延迟和回收速度，开销及丢样率需实测。
 
-文件名为 kernel-主机-PID-d设备-创建时间.jsonl。记录使用 event、op_name、kernel_name，gid 为进程内序号，同一文件中的 launch 与 end 按 gid 关联。notify、dispatch、combine 的每次启动分别预留 ticket，独立发布 done_seq；不同阶段可以交错完成，不能按文件相邻行配对。分离 combine 的阶段耗时不可直接当作完整 Python API 耗时。early 阶段只表示该 kernel 的提交工作结束，异步 UDMA 传输仍可能在进行，其完成等待由后续阶段负责。设备验证应包含超过 128 次调用的槽位复用、不同 AIV 数量、精度和开关性能对照。
+notify、dispatch、combine 的每次启动分别预留 ticket，独立发布 done_seq；不同阶段可以交错完成，以同一通信组、设备上的 `gid` 关联超时和完成记录。分离 combine 的阶段耗时不可直接当作完整 Python API 耗时。early 阶段只表示该 kernel 的提交工作结束，异步 UDMA 传输仍可能在进行，其完成等待由后续阶段负责。
 
 
-## Host 元数据与调用关联
+## 开发诊断与验收
+
+普通 `--npu` 开关对照使用上文的生产写入器，验收 `type=1/2` 格式的 `.txt` 轮转文件。带 `--diagnostic` 时，worker 使用单次试验的独立目录输出开发产物，保留 `kernel-*.jsonl` 的 `calibration`、`launch`、`end` 和 `summary` 等事件，供 `scripts/check_kernel_trace.py` 校验。
+
+### Host 元数据与调用关联
 
 每条启用 V2 元数据的 launch/end 记录增加 metadata_version=1。元数据在 Python API 的 Host 路径构造，C++ 在 Reserve 时为对应槽保留不可变快照；设备仍只写起止 tick 和 done_seq，Host 映射区布局和 kernel 参数均未因本次元数据扩展而改变。后台线程调用原生侧合并记录并编码，不从 NPU tensor 回读参数。
 
@@ -76,11 +139,11 @@ Host 为成功预留的槽分配从 1 开始的进程内序号，kernel 按此�
 | kernel_input_rows / kernel_output_rows | dispatch/combine 启动点实际传入的输入/输出 tensor 行数；notify 不附加这两个字段。固定容量输出记录的是分配行数，不冒充有效接收行数 |
 | cached / do_expand | 是否 cached dispatch、是否使用展开模式，0/1 |
 | token_capacity | Buffer/handle 的每 rank token 容量，与实际 token 数分开 |
-| comm_id | 每次 Buffer 初始化，由 EP rank 0 生成并发给组内所有 rank 的 UUID；同组此次 Buffer 实例一致，重新创建 Buffer 会生成新 ID |
+| comm_id | 每次 Buffer 初始化，由 EP rank 0 生成并发给组内所有 rank 的随机无符号 64 位整数。诊断记录用十进制字符串表示，同组此次 Buffer 实例使用同一 ID |
 | buffer_id | 本进程内的 Python Buffer 标识；即使共享原生采集器也独立 |
 | process_id / hostname / pid | 进程生命周期 UUID、主机名、操作系统 PID；PID 可复用，因此跨文件身份使用 process_id |
 | rank / global_rank | EP 组内 rank；global_rank 仅在已初始化的 PyTorch distributed 环境中获取，其他环境省略，不用组内 rank 冒充 |
-| device | ACL 逻辑设备编号，不能当作物理 PCI bus ID |
+| device | ACL 用户设备编号 |
 | stream | 实际 kernel 启动点的 ACL stream 句柄，以十进制字符串保存，避免无符号地址精度或溢出问题；只在本进程/设备生命周期内解释 |
 | aiv | 本次实际启动核数；combine 通信与归约允许不同核数 |
 | api_name / api_call_id | dispatch 或 combine，以及本进程内独立的调用编号；一次 API 内 notify/通信/归约共用该编号 |
@@ -101,11 +164,11 @@ C++ 元数据上下文采用线程局部存储和作用域恢复，异常退出�
 
 只用初始化时的配置决定是否启用采集。多个 Buffer 可以共享日志线程和原生槽池，但各自的 comm_id/buffer_id 随调用快照保存。Graph 捕获/重放仍不产生 kernel trace，调用编号因此可能有空缺。
 
-本次不补充 GPU NVLink 域 rank、GPU kernel 内部 iter、训练 step/microbatch 编号或物理 PCI bus ID；也不增加 Python API 周期汇总、文件轮转或版本配置日志。它们不能由现有 kernel gid 推导出来。当前元数据接入 V2 Python API；直接调用底层原生接口不保证有完整 Python API/handle 元数据。
+调用元数据来自 V1 和 V2 Python API。V1 保持六元素 handle 接口，Buffer 返回的 handle 保存可用的路由标量和原始 fresh `dispatch_count`。省略路由张量或传入普通六元组时，不能取得的字段按现有规则写为 `null`。开发事件中的 `device` 为 ACL 用户设备编号。采集器查询物理设备编号并将其写为生产记录的 `bus_id`。
 
-新数据建议使用 --require-metadata 校验，检查字段完整性、launch/end 元数据相等、同一 API 的元数据一致性及 handle 路由信息稳定性。旧日志不带此参数仍可校验。远端验证应覆盖 fresh/cached/无 weight 与带 weight 的 combine、expand=0/1、超过 128 槽的复用、不同通信/归约 AIV 数，以及多个 Buffer 的身份隔离。必须重新构建 Host 扩展；性能开销需要相同输入下 trace 开关对照。
+开发产物可使用 `scripts/check_kernel_trace.py` 的 `--require-metadata` 选项校验字段完整性、launch/end 元数据相等、同一 API 的元数据一致性及 handle 路由信息稳定性。旧版 `kernel-*.jsonl` 无需该选项仍可校验。远端验证应覆盖 fresh/cached/无 weight 与带 weight 的 combine、expand=0/1、超过 128 槽的复用、不同通信/归约 AIV 数，以及多个 Buffer 的身份隔离。必须重新构建 Host 扩展；性能开销需要相同输入下 trace 开关对照。
 
-## 新元数据与开销验收用例
+### 生产日志与开销验收用例
 
 `tests/runtime/test_kernel_trace.py` 同时提供 CPU 回归和可选择运行的 NPU 验收入口，不需要新建 benchmark 脚本。
 
@@ -118,26 +181,23 @@ python -m pytest tests/runtime/test_kernel_trace.py -q
 在已安装本分支 wheel、Torch、torch_npu、pytest 的 Linux 单机 UDMA 环境，空闲的四张 NPU 上执行：
 
 ```bash
-python -u tests/runtime/test_kernel_trace.py --npu \
+python -u tests/runtime/test_kernel_trace.py --npu --api-version v1 \
     --ep-size 4 --first-device 0 \
     --num-tokens 2048 --hidden 6144 --num-topk 8 --experts-per-rank 32 \
-    --aiv 32 --reduce-aiv 32 \
+    --aiv 32 \
     --pairs 6 --windows 3 --iterations 100 --warmup 10 \
     --output "$PWD/kernel_trace_acceptance_$(date +%Y%m%d_%H%M%S)"
 ```
 
-输出目录必须尚不存在。也可设置 `DEEPEP_RUN_TRACE_NPU=1` 后通过 pytest 运行 `test_npu_metadata_and_overhead`；该入口使用上述默认配置。普通 pytest 默认跳过实机测试。
+输出目录必须尚不存在。`--api-version` 默认为 `v2`，开发诊断沿用 V2。也可设置 `DEEPEP_RUN_TRACE_NPU=1` 后通过 pytest 运行 `test_npu_metadata_and_overhead`，该入口使用默认 V2 配置。普通 pytest 默认跳过实机测试。
 
-此用例固定 BF16、随机路由、expand=0、无 bias，不清理 L2。依次覆盖 fresh dispatch、cached dispatch、无 weight 和带 weight 的 combine。weight 是 combine 的 topk_weights 输入，未增加 bias。精度用独立 CPU reference 检查，发生在计时之前。
+此用例固定 BF16、随机路由、expand=0、无 bias，不清理 L2。依次覆盖 fresh dispatch、cached dispatch、无 weight 和带 weight 的 combine。V1 fresh 将 `get_dispatch_layout()` 计入 API 耗时，V1 combine 使用同一个 `--aiv` 配置。weight 是 combine 的 topk_weights 输入，未增加 bias。精度用独立 CPU reference 检查，发生在计时之前。
 
-采集开启时，检查所有 rank 的真实 JSONL：
+普通 `--npu` 验收不带 `--diagnostic`。每个 on 试次设置 `DEEPEP_TRACE_RECORDER_ENABLE=1`，通过 `DEEPEP_TRACE_DIR` 指向本次的 `trace/` 子目录，使用生产写入器。正式采集固定使用 128 槽，`--trace-slots` 只控制开发诊断。
 
-- 字段完整、launch/end 配对、时钟换算一致，且 summary 中 dropped/incomplete 均为零。
-- shape、dtype、原始 token 数、专家数、容量、实际输入/输出行数、PID、device 和 global_rank 与测试输入/进程相符。
-- comm_id 覆盖完整 EP 组；每次 fresh 调用产生不同 handle_id，cached dispatch 和两种 combine 引用准备阶段的同一个 handle。
-- API 调用数与准备、预热和正式执行数一致，每个日志超过 128 条完成记录。代际旧值拒收由 CPU 原生协议测试另行验证。
+验收检查所有 rank 的生产日志，按 `op` 校验长短格式、字段及类型，再核对 `type=2` 完成记录数是否与精度检查、预热和正式执行预期一致。同一 rank 的完成记录需要可由同一个时钟校准偏移换算，允许墙钟时间截断至微秒带来的误差。出现 `type=1` 时仍按超时规则检查设备时间字段，它不计入完成数。off 试次不应产生 trace。槽位代际旧值拒收由 CPU 原生协议测试另行验证。
 
-每对 A/B 使用独立的 torchrun 进程组，交替执行 off→on、on→off，默认共 6 对、12 次进程组/Buffer 初始化。子进程清除继承的 DEEPEP_TRACE_DIR 和 PYTHONPATH，在输出目录运行以加载已安装 wheel；其他运行环境保持一致。初始化、精度检查、预热和退出排空不计入稳态开销。
+每对 A/B 使用独立的 torchrun 进程组，交替执行 off→on、on→off，默认共 6 对、12 次进程组/Buffer 初始化。子进程按试次设置采集环境，清除继承的 PYTHONPATH，在输出目录运行以加载已安装 wheel；其他运行环境保持一致。初始化、精度检查、预热和退出排空不计入稳态开销。
 
 计时不启用 profiler、不捕获 Graph，每个窗口连续执行多次 eager API。窗口前设备同步和 Host barrier 在计时之外，窗口末设备同步计入耗时；逐次只插入正常的事件流依赖，不额外逐次做 Host 同步。计时包含 Host 提交、设备执行、业务路径原有同步和同时运行的 Python 日志线程影响。每个窗口取所有 rank 的最大耗时，各窗口取中位数，得到一次进程试验的每 API 耗时。
 
@@ -154,8 +214,8 @@ $$
 产物如下：
 
 - `acceptance.json`：总结果、四种操作的开销、区间及 PASS/FAIL/INCONCLUSIVE；异常时保存失败原因。
-- `config.json`、`runs.json`：配置、各对 A/B 的汇总原始值。
-- `pairXX_on/trace/`：真实 Python 落盘日志；off 目录不应有 trace。
+- `config.json`、`runs.json`：配置（含轮询和超时的环境变量值）、各对 A/B 的汇总原始值。
+- `pairXX_on/trace/trmt-deepep-trace-*.txt`：生产写入器生成的日志；off 目录不应有 trace。
 - `pairXX_on/` 和 `pairXX_off/` 下的 `rankN.json`：每 rank 每窗口耗时、初始化/退出排空耗时、wheel 路径和精度结果；`run.log` 保存 torchrun 输出。
 
 单次 torchrun 默认超时 1800 秒，可用 `--timeout` 调整。超时或中断时终止该次创建的进程组，不影响其他任务。未实际执行 NPU 验收前，CPU 测试通过不能视为开销已满足 1%。
@@ -169,7 +229,7 @@ $$
 | 模式 | 实际工作 | 输出 |
 | --- | --- | --- |
 | off | 完全关闭采集 | rank 耗时/精度 JSON |
-| production | 普通采集路径，只设置 trace 目录，清除两个诊断环境变量；无诊断调用计数或批次计数 | kernel JSONL，无 diagnostic JSON |
+| production | 开发对照基线，使用原有 JSONL 写入路径，清除两个诊断环境变量；无诊断调用计数或批次计数 | kernel JSONL，无 diagnostic JSON |
 | record_only | 与 production 相同的前台元数据、launch、设备 tick/done_seq；不启动采集线程，仅在显式窗口边界或 destroy 时收集 | 完整 JSONL，无 diagnostic JSON |
 | metadata | 仅执行 API 元数据构造、原生上下文交换与恢复；不分配采集环、不启动校准 kernel 或采集线程 | rank JSON 中的元数据调用统计 |
 | native | 元数据、设备打点、Python 线程轮询原生 Drain；不把每条记录转换成 Python 字典 | 退出时的 diagnostic JSON |
@@ -204,17 +264,17 @@ python -u tests/runtime/test_kernel_trace.py --npu --diagnostic \
 
 `diagnosis.json` 汇总五种模式相对 off 的开销，`diagnostic_valid=true` 只表示诊断证据通过完整性检查，`performance_acceptance` 始终为 false。完整性失败返回非零并保留原因；性能变慢本身不使诊断任务失败。native/json/full 的计数校验针对本用例当前 eager 非展开的 notify+dispatch、communication+reduce 路径（每次 API 两个 kernel）；改变执行策略后若 kernel 数不同，应先核对实际路径，不放宽丢样检查。
 
-诊断环境变量只供本功能排查，并在初始化时确定：`DEEPEP_TRACE_DIAGNOSTIC_MODE=record_only|metadata|native|json_discard|json|full`，`DEEPEP_TRACE_DIAGNOSTIC_TIMING=0|1`，开启模式还需设置 DEEPEP_TRACE_DIR。EP 内配置必须一致；不支持运行中修改。测试控制器自动管理并清除继承值，正常 `--npu` 验收也会清除诊断变量。没有诊断变量时保持原有完整采集路径。production 只是测试控制器的模式名称，不是诊断环境变量的合法值。
+诊断环境变量由测试控制器管理并在初始化时读取：`DEEPEP_TRACE_DIAGNOSTIC_MODE=record_only|metadata|native|json_discard|json|full`，`DEEPEP_TRACE_DIAGNOSTIC_TIMING=0|1`。EP 内配置必须一致，普通 `--npu` 验收会清除这两个诊断变量。`--diagnostic` 的 `production` 模式使用原有开发 JSONL 基线，以保持各诊断分层之间的比较口径。生产写入路径的开关对照使用不带 `--diagnostic` 的 `--npu`。
 
 相邻模式的差值包含工作重叠、线程调度变化及小额诊断统计成本，不能当作各模块的精确独占时间。优先用未加细分计时的五组结果定位增量，再结合计时轮次解释。json 与 native 的差值现在主要对应原生编码和批量文本传递，不能沿用旧版的逐事件 Python 转换/编码归因。最终优化必须回到原始完整采集开关 A/B 验收。
 
 
 ## 普通采集对照和编码返回链路定位
 
-诊断 full 即使关闭细分计时，仍包含每 API 调用计数、每批原生计数返回及 Python 累加；它与普通采集并非同一路径。先比较普通采集和诊断 full，再拆分编码与文本返回，两个步骤均沿用同一个 worker、shape、精度检查及计时边界。
+诊断 full 即使关闭细分计时，仍包含每 API 调用计数、每批原生计数返回及 Python 累加。先比较开发基线 production 和诊断 full，再拆分编码与文本返回，两个步骤均沿用同一个 worker、shape、精度检查及计时边界。
 
 ```bash
-# 第一步：普通 off/on 与诊断 off/full，六轮共 24 次进程组初始化。
+# 第一步：开发基线 off/production 与诊断 off/full，六轮共 24 次进程组初始化。
 python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselines \
     --modes off production full --rounds 6 \
     --ep-size 4 --first-device 0 --num-tokens 2048 --hidden 6144 \
@@ -293,7 +353,7 @@ python -u tests/runtime/test_kernel_trace.py --npu --diagnostic --paired-baselin
     --output "$PWD/trace_default_capacity_$(date +%Y%m%d_%H%M%S)"
 ```
 
-容量通过初始化变量 `DEEPEP_TRACE_SLOTS` 传入原生层，未设置时为 128；不支持运行中改变。控制器清除继承值，calibration 输出实际 `slots` 和 `slot_bytes`；Host 映射区大小是二者乘积，另有 Host 槽状态和待收集元数据。扩大容量会改变后台扫描范围和内存占用，所以大环 production 结果必须与默认 128 槽参考分别标注，不直接外推为正常部署开销。
+诊断容量通过初始化变量 `DEEPEP_TRACE_SLOTS` 传入原生层，未设置时为 128；不支持运行中改变。控制器清除继承值，calibration 输出实际 `slots` 和 `slot_bytes`；Host 映射区大小是二者乘积，另有 Host 槽状态和待收集元数据。扩大容量会改变后台扫描范围和内存占用，所以大环 production 结果必须与默认 128 槽参考分别标注，不直接外推为正常部署开销。
 
 `rankN.json` 记录实际容量及 record_only 的 `deferred_evidence`：采集线程不存在、destroy 前收集次数为 0、destroy 后为 1。任一不符合、容量不匹配、丢样或未完成记录都会失败。释放资源及延后落盘耗时记录在 `destroy_and_drain_ns`，不计入 API 墙钟；该字段也包含业务资源销毁，不能全算作日志成本。record_only 与 production 都不允许细分诊断计时。
 
@@ -456,9 +516,11 @@ CPU 回归实际调用 fresh/cached 包装，检查采集开关、模板复用�
 
 缓存只保留标量和原生快照，不保留用户 tensor 或 handle 对象。shape、dtype、容量或模式变化会使用新模板；超过 64 种时清空模板缓存。正在执行或延迟执行的 kernel 持有 shared_ptr 父快照引用，不受缓存清空影响。上下文仍是线程局部的，嵌套调用及异常退出使用原生句柄恢复。
 
-每次调用仍读取 Host tensor 属性、更新 ID、预留槽位和记录 launch 时间，并非零开销。kernel 的 tick、done_seq 和满槽跳过机制保持不变。Python 仍拥有后台线程、文件和退出排空流程。JSON 保留所有字段和整数精度，转义控制字符、引号与反斜杠，UTF-8 可直接输出；字段顺序、空格和非 ASCII 转义形式可能变化，按 JSON 解析后的值兼容。
+每次调用仍读取 Host tensor 属性、更新 ID、预留槽位和记录 launch 时间，并非零开销。kernel 的 tick、done_seq 和满槽跳过机制保持不变。Python 管理后台线程和退出排空。开发和生产路径各自在 C++ 编码对应的 JSONL 格式。Python 写入编码后的内容，并管理生产日志的文件轮转。
 
-重新构建安装 Host 扩展后，先运行本文 CPU 回归，再运行原始 --npu 完整采集开关 A/B，不加诊断参数。检查精度、元数据、零丢样和实际开销。诊断的 json/full 已采用新编码实现，分项不能直接套用旧版本含义。本次优化尚未完成 NPU 实测，不能承诺开销低于 1%。
+重新构建安装 Host 扩展后，先运行本文 CPU 回归，再运行不带 `--diagnostic` 的 `--npu` 正式采集开关 A/B。检查精度、生产日志字段、完成记录数和实际开销。诊断的 json/full 已采用新编码实现，分项不能直接套用旧版本含义。
+
+本次 EP4 实测中，V1 和 V2 各完成六对开关试次，精度均通过。V1 日志完整，Fresh dispatch 配对中位开销为 +11.01%，未通过 1% 验收。V2 Fresh dispatch 配对中位开销为 +10.73%，判定为 `INCONCLUSIVE`。V2 有两个开启试次共丢弃 19 条 Combine 记录，日志完整性未通过。
 
 ### 调用上下文的轻量化
 

@@ -121,6 +121,26 @@ python -m pip install -v --no-build-isolation --no-deps .
 
 The package name is `ascend-deepep`; the Python import is `deep_ep`. See the [build guide](docs/build.md) for wheel packaging and multi-node installation.
 
+### Kernel tracing
+
+On Ascend950 Global Clos, V1 `Buffer` and V2 `ElasticBuffer` can trace individual notify, dispatch, and combine kernels on the eager UDMA path. Tracing is off by default. To enable it, set this before launch on every rank in the EP group:
+
+```bash
+export DEEPEP_TRACE_RECORDER_ENABLE=1
+# Optional: set the output directory and timing parameters before creating a Buffer.
+# export DEEPEP_TRACE_DIR=/path/to/deepep-logs
+# export DEEPEP_TRACE_POLL_INTERVAL_MS=2
+# export DEEPEP_TRACE_TIMEOUT_MS=10000
+```
+
+`DEEPEP_TRACE_POLL_INTERVAL_MS` controls the wait before each background scan and defaults to 2 ms. `DEEPEP_TRACE_TIMEOUT_MS` sets the elapsed time after successful Host submission at which a scan can report `type=1` and defaults to 10000 ms (10 seconds).
+
+The recorder writes one JSON object per line to the node-local directory selected by `DEEPEP_TRACE_DIR`. If unset or empty, it uses `/dockerdata/.trmt/deepep/`. Files are named `trmt-deepep-trace-<commId>-<busId>-<0–7>.txt`.
+
+`commId` is the decimal representation of a random unsigned 64-bit communication group ID. The filename's `busId` and the JSON field `bus_id` both use the host's CANN physical device ID directly for every connection type. For example, physical device 4 has `bus_id=4`. The `comm_id` and `bus_id` JSON fields are integers. Each group and device pair has eight files, capped at 1,000,000,000 bytes each. Rotation overwrites the oldest file.
+
+**Recorder startup deletes historical trace files with matching device ownership in the selected directory. Archive logs you need before rerunning.** See the [trace fields, rotation rules, and developer diagnostics](docs/kernel-trace.md).
+
 ### Install MegaMoE
 
 With matching Torch/torch_npu and CANN 9.2.0, run:
